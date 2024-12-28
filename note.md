@@ -4,6 +4,6 @@
 
 ## servers:
 
-|---|----|----|
-| id | guildId | number|
-| test | test | test |
+| Primary Key | Value 1 | Value 2 |
+| ----------- | ------- | ------- |
+| id          | guildId | number  |
