@@ -1,4 +1,5 @@
 from discord.ext import commands
+from cogs.general.admin import is_admin
 
 
 class General(commands.Cog):
@@ -6,6 +7,7 @@ class General(commands.Cog):
         self.bot = bot
 
     @commands.command()
+    @is_admin()
     async def ping(self, ctx):
         """Check bot latency."""
         await ctx.send(f"Pong! {round(self.bot.latency * 1000)}ms")
@@ -37,6 +39,20 @@ class General(commands.Cog):
             await ctx.send(f"The result of `{num1} {operator} {num2}` is `{result}`.")
         except Exception as e:
             await ctx.send(f"An error occurred: {e}")
+
+    @commands.command()
+    async def check_info(self, ctx):
+        await ctx.send(
+            f"hi {ctx.author.name}, {ctx.author.display_name}, {ctx.author.nick}"
+        )
+
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx, error):
+        """Handle errors for the cog."""
+        if isinstance(error, commands.CheckFailure):
+            await ctx.send("You do not have permission to use this command.")
+        else:
+            raise error
 
 
 async def setup(bot):  # Ensure the setup is asynchronous
