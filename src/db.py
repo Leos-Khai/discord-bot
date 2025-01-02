@@ -119,6 +119,46 @@ def remove_channel_link(link_id):
     conn.close()
 
 
+def update_channel_link_text(voice_channel_id, new_text_channel_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE channel_links
+        SET text_channel_id = ?
+        WHERE voice_channel_id = ?
+        """,
+        (new_text_channel_id, voice_channel_id),
+    )
+
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    return updated
+
+
+def update_channel_link_role(voice_channel_id, new_role_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE channel_links
+        SET role_id = ?
+        WHERE voice_channel_id = ?
+        """,
+        (new_role_id, voice_channel_id),
+    )
+
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    return updated
+
+
 def get_channel_links_by_guild(guild_id):
     """Retrieve all channel links for a specific guild."""
     conn = sqlite3.connect(DB_FILE)

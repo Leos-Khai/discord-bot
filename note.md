@@ -7,3 +7,7 @@
 | Primary Key | Value 1 | Value 2 |
 | ----------- | ------- | ------- |
 | id          | guildId | number  |
+
+## Ideas
+
+- !help - Update it

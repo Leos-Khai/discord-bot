@@ -40,12 +40,6 @@ class General(commands.Cog):
         except Exception as e:
             await ctx.send(f"An error occurred: {e}")
 
-    @commands.command()
-    async def check_info(self, ctx):
-        await ctx.send(
-            f"hi {ctx.author.name}, {ctx.author.display_name}, {ctx.author.nick}"
-        )
-
     @commands.Cog.listener()
     async def on_command_error(self, ctx, error):
         """Handle errors for the cog."""
