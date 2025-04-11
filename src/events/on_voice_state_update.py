@@ -41,32 +41,34 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if after_text_channel:
-                    message = f"{member.display_name}({member.name}) has joined {after.channel.name}."
-                    if role:
-                        message += f" {role.mention}"
+                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
                     await after_text_channel.send(message)
 
             elif before_channel_link and not after_channel_link:
                 # Transitioning from a database channel to a non-database channel
-                guild_id, text_channel_id, _ = before_channel_link
-                _, before_text_channel, _ = get_guild_entities(
-                    guild_id, text_channel_id
+                guild_id, text_channel_id, role_id = before_channel_link
+                _, before_text_channel, role = get_guild_entities(
+                    guild_id, text_channel_id, role_id
                 )
 
                 if before_text_channel:
-                    message = f"{member.display_name}({member.name}) has left {before.channel.name}."
+                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
                     await before_text_channel.send(message)
 
             elif before_channel_link and after_channel_link:
                 # Transitioning between database channels
-                before_guild_id, before_text_channel_id, _ = before_channel_link
-                after_guild_id, after_text_channel_id, role_id = after_channel_link
-
-                _, before_text_channel, _ = get_guild_entities(
-                    before_guild_id, before_text_channel_id
+                before_guild_id, before_text_channel_id, before_role_id = (
+                    before_channel_link
                 )
-                _, after_text_channel, role = get_guild_entities(
-                    after_guild_id, after_text_channel_id, role_id
+                after_guild_id, after_text_channel_id, after_role_id = (
+                    after_channel_link
+                )
+
+                _, before_text_channel, before_role = get_guild_entities(
+                    before_guild_id, before_text_channel_id, before_role_id
+                )
+                _, after_text_channel, after_role = get_guild_entities(
+                    after_guild_id, after_text_channel_id, after_role_id
                 )
 
                 if (
@@ -76,22 +78,18 @@ class OnVoiceStateUpdate(commands.Cog):
                 ):
                     # Same text channel for both before and after channels
                     message = (
-                        f"{member.display_name}({member.name}) moved from {before.channel.name} "
+                        f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) moved from {before.channel.name} "
                         f"to {after.channel.name}."
                     )
-                    if role:
-                        message += f" {role.mention}"
                     await before_text_channel.send(message)
                 else:
                     # Separate text channels for before and after channels
                     if before_text_channel:
-                        leave_message = f"{member.display_name}({member.name}) has left {before.channel.name}."
+                        leave_message = f"{before_role.mention if before_role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
                         await before_text_channel.send(leave_message)
 
                     if after_text_channel:
-                        join_message = f"{member.display_name}({member.name}) has joined {after.channel.name}."
-                        if role:
-                            join_message += f" {role.mention}"
+                        join_message = f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
                         await after_text_channel.send(join_message)
 
         # Handle leaving a voice channel
@@ -100,11 +98,13 @@ class OnVoiceStateUpdate(commands.Cog):
             channel_link = get_channel_link(voice_channel_id)
 
             if channel_link:
-                guild_id, text_channel_id, _ = channel_link
-                _, text_channel, _ = get_guild_entities(guild_id, text_channel_id)
+                guild_id, text_channel_id, role_id = channel_link
+                _, text_channel, role = get_guild_entities(
+                    guild_id, text_channel_id, role_id
+                )
 
                 if text_channel:
-                    message = f"{member.display_name}({member.name}) has left {before.channel.name}."
+                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
                     await text_channel.send(message)
 
         # Handle joining a voice channel
@@ -119,9 +119,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if text_channel:
-                    message = f"{member.display_name}({member.name}) has joined {after.channel.name}."
-                    if role:
-                        message += f" {role.mention}"
+                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
                     await text_channel.send(message)
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import asyncio
 from db import initialize_database
+from logger import get_logger
 
 # Load config
 with open("config.json") as f:
@@ -11,6 +12,8 @@ with open("config.json") as f:
 
 # Create bot
 bot = commands.Bot(command_prefix=config["prefix"], intents=discord.Intents.all())
+
+logger = get_logger()
 
 
 async def load_cogs():
@@ -21,9 +24,13 @@ async def load_cogs():
                 if file.endswith(".py") and not file.startswith("__"):
                     try:
                         await bot.load_extension(f"cogs.{folder}.{file[:-3]}")
-                        print(f"Successfully loaded command module: {folder}/{file}")
+                        logger.info(
+                            f"Successfully loaded command module: {folder}/{file}"
+                        )
                     except Exception as e:
-                        print(f"Failed to load command module: {folder}/{file} - {e}")
+                        logger.error(
+                            f"Failed to load command module: {folder}/{file} - {e}"
+                        )
 
 
 async def load_events():
@@ -32,9 +39,9 @@ async def load_events():
         if file.endswith(".py") and not file.startswith("__"):
             try:
                 await bot.load_extension(f"events.{file[:-3]}")
-                print(f"Successfully loaded event: {file}")
+                logger.info(f"Successfully loaded event: {file}")
             except Exception as e:
-                print(f"Failed to load event: {file} - {e}")
+                logger.error(f"Failed to load event: {file} - {e}")
 
 
 async def main():
