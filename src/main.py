@@ -6,8 +6,11 @@ import asyncio
 from db import initialize_database
 from logger import get_logger
 
+# Get the directory of the current script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
 # Load config
-with open("config.json") as f:
+with open(os.path.join(script_dir, "config.json")) as f:
     config = json.load(f)
 
 # Create bot
@@ -18,9 +21,10 @@ logger = get_logger()
 
 async def load_cogs():
     """Dynamically load all cogs from the cogs folder."""
-    for folder in os.listdir("./cogs"):
-        if os.path.isdir(f"./cogs/{folder}") and not folder.startswith("__"):
-            for file in os.listdir(f"./cogs/{folder}"):
+    cogs_dir = os.path.join(script_dir, "cogs")
+    for folder in os.listdir(cogs_dir):
+        if os.path.isdir(os.path.join(cogs_dir, folder)) and not folder.startswith("__"):
+            for file in os.listdir(os.path.join(cogs_dir, folder)):
                 if file.endswith(".py") and not file.startswith("__"):
                     try:
                         await bot.load_extension(f"cogs.{folder}.{file[:-3]}")
@@ -35,7 +39,8 @@ async def load_cogs():
 
 async def load_events():
     """Dynamically load all events from the events folder."""
-    for file in os.listdir("./events"):
+    events_dir = os.path.join(script_dir, "events")
+    for file in os.listdir(events_dir):
         if file.endswith(".py") and not file.startswith("__"):
             try:
                 await bot.load_extension(f"events.{file[:-3]}")
