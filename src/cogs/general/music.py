@@ -16,7 +16,8 @@ FFMPEG_OPTIONS = {
 class MusicCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.volumes_file = "volumes.json"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.volumes_file = os.path.join(script_dir, "..", "..", "volumes.json")
         if os.path.exists(self.volumes_file):
             try:
                 with open(self.volumes_file, "r") as f:

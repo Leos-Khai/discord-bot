@@ -1,6 +1,8 @@
 import sqlite3
+import os
 
-DB_FILE = "discord_bot.db"
+script_dir = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(script_dir, "discord_bot.db")
 
 
 def initialize_database():
