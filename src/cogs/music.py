@@ -17,7 +17,8 @@ class MusicCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.volumes_file = os.path.join(script_dir, "..", "..", "volumes.json")
+        # Correctly locate volumes.json within the src directory
+        self.volumes_file = os.path.join(script_dir, "..", "volumes.json")
         if os.path.exists(self.volumes_file):
             try:
                 with open(self.volumes_file, "r") as f:
@@ -313,11 +314,15 @@ class MusicCommands(commands.Cog):
     @commands.command(
         help="Set the music volume.\nUsage: !volume <0-150>\nExample: !volume 50\nVolume setting persists between sessions."
     )
-    async def volume(self, ctx, vol: int):
+    async def volume(self, ctx, vol: int = None):
+        gid = str(ctx.guild.id)
+        if vol is None:
+            current_volume = int(self.volumes.get(gid, 1.0) * 100)
+            await ctx.send(f"Current volume for this server is {current_volume}%.")
+            return
         if vol < 0 or vol > 150:
             await ctx.send("Volume must be between 0 and 150.")
             return
-        gid = str(ctx.guild.id)
         self.volumes[gid] = vol / 100
         with open(self.volumes_file, "w") as f:
             json.dump(self.volumes, f)
