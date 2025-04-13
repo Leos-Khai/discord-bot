@@ -3,7 +3,7 @@ from discord.ext import commands
 import yt_dlp as youtube_dl
 import os
 import json
-from cogs.general.admin import is_admin
+from cogs.admin import is_admin
 
 youtube_dl.utils.bug_reports_message = lambda: ""
 YDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": False, "quiet": True}
@@ -53,7 +53,9 @@ class MusicCommands(commands.Cog):
         else:
             self.current_tracks[gid] = None
 
-    @commands.command(name="join", help="Bot joins the voice channel you are in.")
+    @commands.command(
+        help="Join a voice channel.\nUsage: !join\nMust be in a voice channel to use this command."
+    )
     async def join(self, ctx):
         if not ctx.author.voice:
             await ctx.send("You are not connected to a voice channel.")
@@ -74,7 +76,9 @@ class MusicCommands(commands.Cog):
                 await ctx.send(f"Error connecting to voice channel: {e}")
                 print(f"Error connecting to voice channel: {e}")
 
-    @commands.command(name="play", help="Plays audio from a YouTube link or playlist.")
+    @commands.command(
+        help="Play music from YouTube.\nUsage: !play <URL>\nSupports single videos and playlists.\nExample: !play https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
     async def play(self, ctx, url: str):
         if not ctx.voice_client:
             if ctx.author.voice:
@@ -151,7 +155,7 @@ class MusicCommands(commands.Cog):
                 await ctx.send(f"Now playing: {track['title']}")
 
     @commands.command(
-        name="search", help="Search YouTube for a track and choose one to play."
+        help="Search YouTube and choose a song to play.\nUsage: !search <query>\nShows top 5 results and lets you choose.\nExample: !search never gonna give you up"
     )
     async def search(self, ctx, *, query: str):
         if not ctx.voice_client:
@@ -226,7 +230,9 @@ class MusicCommands(commands.Cog):
             self.current_tracks[gid] = track
             await ctx.send(f"Now playing: {track['title']}")
 
-    @commands.command(name="queue", help="Lists the next 10 songs in the queue.")
+    @commands.command(
+        help="Display the current queue.\nUsage: !queue\nShows up to 10 upcoming tracks."
+    )
     async def queue_list(self, ctx):
         gid = str(ctx.guild.id)
         queue = self.queues.get(gid, [])
@@ -238,7 +244,7 @@ class MusicCommands(commands.Cog):
             msg += f"{i}. {track['title']}\n"
         await ctx.send(msg)
 
-    @commands.command(name="np", help="Shows the currently playing track.")
+    @commands.command(help="Show the currently playing track.\nUsage: !np")
     async def np(self, ctx):
         gid = str(ctx.guild.id)
         current = self.current_tracks.get(gid)
@@ -247,7 +253,7 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("No track is currently playing.")
 
-    @commands.command(name="skip", help="Skips the current track.")
+    @commands.command(help="Skip the current track.\nUsage: !skip")
     async def skip(self, ctx):
         if ctx.voice_client:
             ctx.voice_client.stop()
@@ -256,8 +262,7 @@ class MusicCommands(commands.Cog):
             await ctx.send("I'm not connected to a voice channel.")
 
     @commands.command(
-        name="remove",
-        help="Removes tracks from the queue. Usage: !remove [1-10|first|last|all|search text]",
+        help="Remove tracks from the queue.\nUsage: !remove <position>\nOptions:\n- Number (1-10): Remove track at position\n- 'first': Remove first track\n- 'last': Remove last track\n- 'all': Clear queue\n- Text: Remove first matching track\nExample: !remove 3"
     )
     async def remove(self, ctx, arg: str):
         gid = str(ctx.guild.id)
@@ -306,8 +311,7 @@ class MusicCommands(commands.Cog):
                     await ctx.send("No track found matching that title.")
 
     @commands.command(
-        name="volume",
-        help="Sets the playback volume as a percentage and saves it for this server.",
+        help="Set the music volume.\nUsage: !volume <0-150>\nExample: !volume 50\nVolume setting persists between sessions."
     )
     async def volume(self, ctx, vol: int):
         if vol < 0 or vol > 150:
@@ -325,7 +329,7 @@ class MusicCommands(commands.Cog):
             ctx.voice_client.source.volume = self.volumes[gid]
         await ctx.send(f"Volume set to {vol}% for this server.")
 
-    @commands.command(name="stop", help="Stops playback and disconnects the bot.")
+    @commands.command(help="Stop playback and disconnect the bot.\nUsage: !stop")
     async def stop(self, ctx):
         if ctx.voice_client:
             try:
@@ -340,7 +344,7 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("I'm not connected to a voice channel.")
 
-    @commands.command(name="pause", help="Pauses the current track.")
+    @commands.command(help="Pause the current track.\nUsage: !pause")
     async def pause(self, ctx):
         if ctx.voice_client.is_playing():
             ctx.voice_client.pause()
@@ -348,20 +352,13 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("No music is currently playing.")
 
-    @commands.command(name="resume", help="Resumes the paused track.")
+    @commands.command(help="Resume the paused track.\nUsage: !resume")
     async def resume(self, ctx):
         if ctx.voice_client.is_paused():
             ctx.voice_client.resume()
             await ctx.send("Music has been resumed.")
         else:
             await ctx.send("Music is not paused.")
-
-    @commands.Cog.listener()
-    async def on_command_error(self, ctx, error):
-        if isinstance(error, commands.CheckFailure):
-            await ctx.send("You do not have permission to use this command.")
-        else:
-            raise error
 
 
 async def setup(bot):

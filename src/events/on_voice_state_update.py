@@ -1,6 +1,45 @@
 import discord
 from discord.ext import commands
-from db import get_channel_link
+from db import get_channel_link, get_custom_message
+
+
+def replace_tokens(
+    message, member, channel=None, old_channel=None, new_channel=None, role=None
+):
+    """Replace message tokens with actual values."""
+    if not message:
+        # Default messages if none is set
+        if old_channel and new_channel:
+            message = f"{member.display_name}({member.name}) moved from {old_channel.name} to {new_channel.name}"
+        elif channel:
+            if old_channel:  # Leave message
+                message = (
+                    f"{member.display_name}({member.name}) has left {channel.name}"
+                )
+            else:  # Join message
+                message = (
+                    f"{member.display_name}({member.name}) has joined {channel.name}"
+                )
+
+    # Append role mention if a role exists
+    if role:
+        message = f"{role.mention} {message}"
+
+    replacements = {
+        "$USER": member.display_name,
+        "$USERNAME": member.name,
+        "$NICKNAME": member.nick or member.display_name,
+        "$MENTION": member.mention,
+        "$CHANNEL": channel.name if channel else "",
+        "$OLD_CHANNEL": old_channel.name if old_channel else "",
+        "$NEW_CHANNEL": new_channel.name if new_channel else "",
+    }
+
+    for token, value in replacements.items():
+        if message:
+            message = message.replace(token, value)
+
+    return message
 
 
 class OnVoiceStateUpdate(commands.Cog):
@@ -41,7 +80,17 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if after_text_channel:
-                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                    custom_msg = get_custom_message(guild_id, "join")
+                    message = (
+                        replace_tokens(
+                            custom_msg,
+                            member,
+                            channel=after.channel,
+                            role=role,
+                        )
+                        if custom_msg
+                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                    )
                     await after_text_channel.send(message)
 
             elif before_channel_link and not after_channel_link:
@@ -52,7 +101,17 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if before_text_channel:
-                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                    custom_msg = get_custom_message(guild_id, "leave")
+                    message = (
+                        replace_tokens(
+                            custom_msg,
+                            member,
+                            channel=before.channel,
+                            role=role,
+                        )
+                        if custom_msg
+                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                    )
                     await before_text_channel.send(message)
 
             elif before_channel_link and after_channel_link:
@@ -77,19 +136,48 @@ class OnVoiceStateUpdate(commands.Cog):
                     and before_text_channel == after_text_channel
                 ):
                     # Same text channel for both before and after channels
+                    custom_msg = get_custom_message(before_guild_id, "move")
                     message = (
-                        f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) moved from {before.channel.name} "
+                        replace_tokens(
+                            custom_msg,
+                            member,
+                            old_channel=before.channel,
+                            new_channel=after.channel,
+                            role=after_role,
+                        )
+                        if custom_msg
+                        else f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) moved from {before.channel.name} "
                         f"to {after.channel.name}."
                     )
                     await before_text_channel.send(message)
                 else:
                     # Separate text channels for before and after channels
                     if before_text_channel:
-                        leave_message = f"{before_role.mention if before_role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                        custom_msg = get_custom_message(before_guild_id, "leave")
+                        leave_message = (
+                            replace_tokens(
+                                custom_msg,
+                                member,
+                                channel=before.channel,
+                                role=before_role,
+                            )
+                            if custom_msg
+                            else f"{before_role.mention if before_role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                        )
                         await before_text_channel.send(leave_message)
 
                     if after_text_channel:
-                        join_message = f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                        custom_msg = get_custom_message(after_guild_id, "join")
+                        join_message = (
+                            replace_tokens(
+                                custom_msg,
+                                member,
+                                channel=after.channel,
+                                role=after_role,
+                            )
+                            if custom_msg
+                            else f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                        )
                         await after_text_channel.send(join_message)
 
         # Handle leaving a voice channel
@@ -104,7 +192,17 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if text_channel:
-                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                    custom_msg = get_custom_message(guild_id, "leave")
+                    message = (
+                        replace_tokens(
+                            custom_msg,
+                            member,
+                            channel=before.channel,
+                            role=role,
+                        )
+                        if custom_msg
+                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
+                    )
                     await text_channel.send(message)
 
         # Handle joining a voice channel
@@ -119,7 +217,17 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if text_channel:
-                    message = f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                    custom_msg = get_custom_message(guild_id, "join")
+                    message = (
+                        replace_tokens(
+                            custom_msg,
+                            member,
+                            channel=after.channel,
+                            role=role,
+                        )
+                        if custom_msg
+                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
+                    )
                     await text_channel.send(message)
 
 

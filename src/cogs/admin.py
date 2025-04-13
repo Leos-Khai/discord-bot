@@ -8,6 +8,7 @@ from db import (
     remove_channel_link,
     update_channel_link_role,
     update_channel_link_text,
+    set_custom_message,
 )
 
 
@@ -24,7 +25,7 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command()
+    @commands.command(help="Lists all active channel links in the current server.")
     @is_admin()
     async def list_links(self, ctx):
         """List all channel links for the guild."""
@@ -51,7 +52,9 @@ class Admin(commands.Cog):
 
         await ctx.send(description)
 
-    @commands.command()
+    @commands.command(
+        help='Links a text channel to a voice channel with an optional role.\nUsage: !link_channel #text-channel "Voice Channel Name" @role\nExample: !link_channel #general "Gaming Voice" @Members'
+    )
     @is_admin()
     async def link_channel(
         self,
@@ -70,7 +73,6 @@ class Admin(commands.Cog):
         """
 
         guild_id = str(ctx.guild.id)
-
         text_channel_id = str(text_channel.id)
 
         # Search for the voice channel by name
@@ -87,13 +89,27 @@ class Admin(commands.Cog):
 
         try:
             add_channel_link(guild_id, text_channel_id, voice_channel_id, role_id)
+
+            # Set default messages for the new link
+            default_messages = {
+                "join": f"$USER joined $CHANNEL",
+                "leave": f"$USER left $CHANNEL",
+                "move": f"$USER moved from $OLD_CHANNEL to $NEW_CHANNEL",
+            }
+
+            for msg_type, msg in default_messages.items():
+                set_custom_message(guild_id, msg_type, msg)
+
             await ctx.send(
-                f"Linked {text_channel.mention} to {voice_channel.name}{' with role ' + role.mention if role else ''}."
+                f"Linked {text_channel.mention} to {voice_channel.name}{' with role ' + role.mention if role else ''}.\n"
+                f"Default notification messages have been set. Use !set_message to customize them."
             )
         except ValueError as e:
             await ctx.send(str(e))
 
-    @commands.command()
+    @commands.command(
+        help="Removes a channel link. Shows a list of links and lets you choose which to remove.\nUsage: !remove_channel\nThen select the number of the link to remove."
+    )
     @is_admin()
     async def remove_channel(self, ctx):
         """!remove_channel - List and remove a channel link.
@@ -147,7 +163,9 @@ class Admin(commands.Cog):
             if isinstance(e.original, discord.errors.TimeoutError):
                 await ctx.send("You took too long to respond.")
 
-    @commands.command()
+    @commands.command(
+        help='Updates the text channel for an existing voice channel link.\nUsage: !update_channel "Voice Channel Name" #new-text-channel\nExample: !update_channel "Gaming Voice" #gaming-chat'
+    )
     @is_admin()
     async def update_channel(
         self, ctx, voice_channel_name: str, new_text_channel: discord.TextChannel
@@ -171,7 +189,9 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
-    @commands.command()
+    @commands.command(
+        help='Updates the role for an existing voice channel link.\nUsage: !update_role "Voice Channel Name" @new-role\nExample: !update_role "Gaming Voice" @Gamers'
+    )
     @is_admin()
     async def update_role(
         self, ctx, voice_channel_name: str, new_role: discord.Role = None
@@ -195,7 +215,9 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
-    @commands.command()
+    @commands.command(
+        help='Removes the role from an existing voice channel link.\nUsage: !remove_role "Voice Channel Name"\nExample: !remove_role "Gaming Voice"'
+    )
     @is_admin()
     async def remove_role(self, ctx, voice_channel_name: str):
         """Remove the role from a link with the given voice channel name."""
@@ -214,11 +236,67 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
+    @commands.command(
+        help="""Sets a custom notification message for voice channel events.
+Available message types: join, leave, move
+Available tokens:
+$USER - Member's display name
+$USERNAME - Member's username
+$NICKNAME - Member's server nickname
+$MENTION - Mentions the user
+$CHANNEL - Current voice channel name
+$OLD_CHANNEL - Previous voice channel name (for move events)
+$NEW_CHANNEL - New voice channel name (for move events)
+
+Example: !set_message join "$USER joined $CHANNEL"
+Example: !set_message move "$USER moved from $OLD_CHANNEL to $NEW_CHANNEL"
+Example: !set_message leave "$MENTION left $CHANNEL"
+Example: !set_message reset join (Resets join message to default)
+Example: !set_message reset all (Resets all messages to default)
+        """
+    )
+    @is_admin()
+    async def set_message(self, ctx, msg_type: str, *, message: str = None):
+        """Set a custom notification message for voice channel events."""
+        msg_type = msg_type.lower()
+
+        if msg_type == "reset":
+            if not message or message.lower() not in ["join", "leave", "move", "all"]:
+                await ctx.send(
+                    "Please specify what to reset: 'join', 'leave', 'move', or 'all'"
+                )
+                return
+
+            message = message.lower()
+            if message == "all":
+                # Reset all message types
+                for type_to_reset in ["join", "leave", "move"]:
+                    set_custom_message(str(ctx.guild.id), type_to_reset, None)
+                await ctx.send("All message types have been reset to default.")
+            else:
+                # Reset specific message type
+                set_custom_message(str(ctx.guild.id), message, None)
+                await ctx.send(
+                    f"Message for {message} events has been reset to default."
+                )
+            return
+
+        if msg_type not in ["join", "leave", "move"]:
+            await ctx.send("Message type must be 'join', 'leave', or 'move'")
+            return
+
+        try:
+            set_custom_message(str(ctx.guild.id), msg_type, message)
+            await ctx.send(f"Successfully set custom message for {msg_type} events.")
+        except ValueError as e:
+            await ctx.send(str(e))
+
     @commands.Cog.listener()
     async def on_command_error(self, ctx, error):
         """Handle errors for the cog."""
         if isinstance(error, commands.CheckFailure):
             await ctx.send("You do not have permission to use this command.")
+            return  # Stop further propagation
         else:
             raise error
 

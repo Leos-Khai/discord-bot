@@ -34,6 +34,20 @@ def initialize_database():
         """
     )
 
+    # Create a table to store custom messages
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custom_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            FOREIGN KEY (guild_id) REFERENCES servers(server_id),
+            UNIQUE(guild_id, type)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -179,3 +193,56 @@ def get_channel_links_by_guild(guild_id):
     conn.close()
 
     return links
+
+
+def set_custom_message(guild_id, msg_type, message):
+    """Set a custom message for a specific guild and type (join/leave/move).
+    If message is None, it will remove the custom message and revert to default."""
+    if msg_type not in ["join", "leave", "move"]:
+        raise ValueError("Message type must be 'join', 'leave', or 'move'")
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    if message is None:
+        # Remove the custom message to revert to default
+        cursor.execute(
+            """
+            DELETE FROM custom_messages
+            WHERE guild_id = ? AND type = ?
+            """,
+            (guild_id, msg_type),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO custom_messages (guild_id, type, message)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, type)
+            DO UPDATE SET message = excluded.message
+            """,
+            (guild_id, msg_type, message),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_custom_message(guild_id, msg_type):
+    """Get a custom message for a specific guild and type."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT message
+        FROM custom_messages
+        WHERE guild_id = ? AND type = ?
+        """,
+        (guild_id, msg_type),
+    )
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result[0] if result else None

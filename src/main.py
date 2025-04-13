@@ -22,19 +22,13 @@ logger = get_logger()
 async def load_cogs():
     """Dynamically load all cogs from the cogs folder."""
     cogs_dir = os.path.join(script_dir, "cogs")
-    for folder in os.listdir(cogs_dir):
-        if os.path.isdir(os.path.join(cogs_dir, folder)) and not folder.startswith("__"):
-            for file in os.listdir(os.path.join(cogs_dir, folder)):
-                if file.endswith(".py") and not file.startswith("__"):
-                    try:
-                        await bot.load_extension(f"cogs.{folder}.{file[:-3]}")
-                        logger.info(
-                            f"Successfully loaded command module: {folder}/{file}"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to load command module: {folder}/{file} - {e}"
-                        )
+    for file in os.listdir(cogs_dir):
+        if file.endswith(".py") and not file.startswith("__"):
+            try:
+                await bot.load_extension(f"cogs.{file[:-3]}")
+                logger.info(f"Successfully loaded cog: {file}")
+            except Exception as e:
+                logger.error(f"Failed to load cog: {file} - {e}")
 
 
 async def load_events():
@@ -50,11 +44,30 @@ async def load_events():
 
 
 async def main():
-    initialize_database()  # Initialize the database
+    try:
+        initialize_database()  # Initialize the database
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        return
+
     async with bot:
-        await load_events()
-        await load_cogs()
-        await bot.start(config["token"])
+        try:
+            await load_events()
+            logger.info("Events loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load events: {e}")
+
+        try:
+            await load_cogs()
+            logger.info("Cogs loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load cogs: {e}")
+
+        try:
+            await bot.start(config["token"])
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
 
 
 if __name__ == "__main__":
