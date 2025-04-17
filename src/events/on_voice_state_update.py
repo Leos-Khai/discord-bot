@@ -69,8 +69,8 @@ class OnVoiceStateUpdate(commands.Cog):
             before_channel_id = str(before.channel.id)
             after_channel_id = str(after.channel.id)
 
-            before_channel_link = get_channel_link(before_channel_id)
-            after_channel_link = get_channel_link(after_channel_id)
+            before_channel_link = await get_channel_link(before_channel_id)
+            after_channel_link = await get_channel_link(after_channel_id)
 
             if not before_channel_link and after_channel_link:
                 # Transitioning from a non-database channel to a database channel
@@ -80,7 +80,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if after_text_channel:
-                    custom_msg = get_custom_message(guild_id, "join")
+                    custom_msg = await get_custom_message(guild_id, "join")
                     message = (
                         replace_tokens(
                             custom_msg,
@@ -101,7 +101,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if before_text_channel:
-                    custom_msg = get_custom_message(guild_id, "leave")
+                    custom_msg = await get_custom_message(guild_id, "leave")
                     message = (
                         replace_tokens(
                             custom_msg,
@@ -136,7 +136,7 @@ class OnVoiceStateUpdate(commands.Cog):
                     and before_text_channel == after_text_channel
                 ):
                     # Same text channel for both before and after channels
-                    custom_msg = get_custom_message(before_guild_id, "move")
+                    custom_msg = await get_custom_message(before_guild_id, "move")
                     message = (
                         replace_tokens(
                             custom_msg,
@@ -153,7 +153,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 else:
                     # Separate text channels for before and after channels
                     if before_text_channel:
-                        custom_msg = get_custom_message(before_guild_id, "leave")
+                        custom_msg = await get_custom_message(before_guild_id, "leave")
                         leave_message = (
                             replace_tokens(
                                 custom_msg,
@@ -167,7 +167,7 @@ class OnVoiceStateUpdate(commands.Cog):
                         await before_text_channel.send(leave_message)
 
                     if after_text_channel:
-                        custom_msg = get_custom_message(after_guild_id, "join")
+                        custom_msg = await get_custom_message(after_guild_id, "join")
                         join_message = (
                             replace_tokens(
                                 custom_msg,
@@ -183,7 +183,7 @@ class OnVoiceStateUpdate(commands.Cog):
         # Handle leaving a voice channel
         elif before.channel and not after.channel:
             voice_channel_id = str(before.channel.id)
-            channel_link = get_channel_link(voice_channel_id)
+            channel_link = await get_channel_link(voice_channel_id)
 
             if channel_link:
                 guild_id, text_channel_id, role_id = channel_link
@@ -192,7 +192,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if text_channel:
-                    custom_msg = get_custom_message(guild_id, "leave")
+                    custom_msg = await get_custom_message(guild_id, "leave")
                     message = (
                         replace_tokens(
                             custom_msg,
@@ -208,7 +208,7 @@ class OnVoiceStateUpdate(commands.Cog):
         # Handle joining a voice channel
         elif not before.channel and after.channel:
             voice_channel_id = str(after.channel.id)
-            channel_link = get_channel_link(voice_channel_id)
+            channel_link = await get_channel_link(voice_channel_id)
 
             if channel_link:
                 guild_id, text_channel_id, role_id = channel_link
@@ -217,7 +217,7 @@ class OnVoiceStateUpdate(commands.Cog):
                 )
 
                 if text_channel:
-                    custom_msg = get_custom_message(guild_id, "join")
+                    custom_msg = await get_custom_message(guild_id, "join")
                     message = (
                         replace_tokens(
                             custom_msg,

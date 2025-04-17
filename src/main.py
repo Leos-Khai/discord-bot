@@ -45,7 +45,7 @@ async def load_events():
 
 async def main():
     try:
-        initialize_database()  # Initialize the database
+        await initialize_database()  # Initialize the database
         logger.info("Database initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")

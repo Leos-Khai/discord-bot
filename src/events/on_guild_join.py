@@ -9,7 +9,7 @@ class OnGuildJoin(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_join(self, guild):
         """Event triggered when the bot joins a new server."""
-        add_server(str(guild.id))
+        await add_server(str(guild.id))
         print(f"Joined new server: {guild.name} (ID: {guild.id})")
 
 

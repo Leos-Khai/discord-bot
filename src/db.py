@@ -1,248 +1,171 @@
-import sqlite3
+from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime
+import json
 import os
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(script_dir, "discord_bot.db")
+
+# Load MongoDB configuration
+with open(os.path.join(script_dir, "config.json")) as f:
+    config = json.load(f)
+
+mongodb_config = config.get(
+    "mongodb", {"uri": "mongodb://localhost:27017", "database": "discord_bot"}
+)
 
 
-def initialize_database():
-    """Initialize the SQLite database and create tables if they do not exist."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+class Database:
+    _instance = None
 
-    # Create a table to store server IDs
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS servers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            server_id TEXT NOT NULL UNIQUE
-        )
-        """
-    )
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
-    # Create a table to store channel links
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS channel_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id TEXT NOT NULL,
-            text_channel_id TEXT NOT NULL,
-            voice_channel_id TEXT NOT NULL UNIQUE,
-            role_id TEXT,
-            FOREIGN KEY (guild_id) REFERENCES servers(server_id)
-        )
-        """
-    )
+    def __init__(self):
+        self.client = AsyncIOMotorClient(mongodb_config["uri"])
+        self.db = self.client[mongodb_config["database"]]
 
-    # Create a table to store custom messages
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS custom_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id TEXT NOT NULL,
-            type TEXT NOT NULL,
-            message TEXT NOT NULL,
-            FOREIGN KEY (guild_id) REFERENCES servers(server_id),
-            UNIQUE(guild_id, type)
-        )
-        """
-    )
-
-    conn.commit()
-    conn.close()
+        # Collections
+        self.servers = self.db.servers
+        self.channel_links = self.db.channel_links
+        self.custom_messages = self.db.custom_messages
 
 
-def add_server(server_id):
+async def initialize_database():
+    """Initialize MongoDB and create indexes."""
+    db = Database.get_instance()
+
+    # Create indexes
+    await db.channel_links.create_index("voice_channel_id", unique=True)
+    await db.custom_messages.create_index([("guild_id", 1), ("type", 1)], unique=True)
+
+
+async def add_server(server_id: str):
     """Add a server ID to the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute("INSERT INTO servers (server_id) VALUES (?)", (server_id,))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        print(f"Server ID {server_id} already exists.")
-    finally:
-        conn.close()
+    db = Database.get_instance()
+    await db.servers.update_one(
+        {"server_id": server_id},
+        {"$setOnInsert": {"server_id": server_id, "created_at": datetime.utcnow()}},
+        upsert=True,
+    )
 
 
-def get_servers():
+async def get_servers():
     """Fetch all server IDs from the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM servers")
-    servers = cursor.fetchall()
-    conn.close()
-
-    return servers
+    db = Database.get_instance()
+    cursor = db.servers.find({}, {"_id": 0})
+    return await cursor.to_list(None)
 
 
-def add_channel_link(guild_id, text_channel_id, voice_channel_id, role_id=None):
+async def add_channel_link(guild_id, text_channel_id, voice_channel_id, role_id=None):
     """Add a channel link to the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
+    db = Database.get_instance()
+    now = datetime.utcnow()
     try:
-        cursor.execute(
-            """
-            INSERT INTO channel_links (guild_id, text_channel_id, voice_channel_id, role_id)
-            VALUES (?, ?, ?, ?)
-            """,
-            (guild_id, text_channel_id, voice_channel_id, role_id),
+        await db.channel_links.insert_one(
+            {
+                "guild_id": guild_id,
+                "text_channel_id": text_channel_id,
+                "voice_channel_id": voice_channel_id,
+                "role_id": role_id,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
+    except Exception as e:
         raise ValueError("The specified voice channel is already linked.")
-    finally:
-        conn.close()
 
 
-def get_channel_link(voice_channel_id):
+async def get_channel_link(voice_channel_id):
     """Retrieve a channel link by voice channel ID."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT guild_id, text_channel_id, role_id
-        FROM channel_links
-        WHERE voice_channel_id = ?
-        """,
-        (voice_channel_id,),
+    db = Database.get_instance()
+    result = await db.channel_links.find_one(
+        {"voice_channel_id": voice_channel_id},
+        {"_id": 0, "created_at": 0, "updated_at": 0},
     )
-
-    result = cursor.fetchone()
-    conn.close()
-
-    return result
+    if result:
+        return result["guild_id"], result["text_channel_id"], result.get("role_id")
+    return None
 
 
-def remove_channel_link(link_id):
+async def remove_channel_link(link_id):
     """Remove a channel link by its ID."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    db = Database.get_instance()
+    await db.channel_links.delete_one({"_id": link_id})
 
-    cursor.execute(
-        """
-        DELETE FROM channel_links
-        WHERE id = ?
-        """,
-        (link_id,),
+
+async def update_channel_link_text(voice_channel_id, new_text_channel_id):
+    """Update the text channel ID for a voice channel link."""
+    db = Database.get_instance()
+    result = await db.channel_links.update_one(
+        {"voice_channel_id": voice_channel_id},
+        {
+            "$set": {
+                "text_channel_id": new_text_channel_id,
+                "updated_at": datetime.utcnow(),
+            }
+        },
     )
-
-    conn.commit()
-    conn.close()
+    return result.modified_count > 0
 
 
-def update_channel_link_text(voice_channel_id, new_text_channel_id):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE channel_links
-        SET text_channel_id = ?
-        WHERE voice_channel_id = ?
-        """,
-        (new_text_channel_id, voice_channel_id),
+async def update_channel_link_role(voice_channel_id, new_role_id):
+    """Update the role ID for a voice channel link."""
+    db = Database.get_instance()
+    result = await db.channel_links.update_one(
+        {"voice_channel_id": voice_channel_id},
+        {"$set": {"role_id": new_role_id, "updated_at": datetime.utcnow()}},
     )
-
-    updated = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-
-    return updated
+    return result.modified_count > 0
 
 
-def update_channel_link_role(voice_channel_id, new_role_id):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        UPDATE channel_links
-        SET role_id = ?
-        WHERE voice_channel_id = ?
-        """,
-        (new_role_id, voice_channel_id),
-    )
-
-    updated = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-
-    return updated
-
-
-def get_channel_links_by_guild(guild_id):
+async def get_channel_links_by_guild(guild_id):
     """Retrieve all channel links for a specific guild."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT id, text_channel_id, voice_channel_id, role_id
-        FROM channel_links
-        WHERE guild_id = ?
-        """,
-        (guild_id,),
+    db = Database.get_instance()
+    cursor = db.channel_links.find(
+        {"guild_id": guild_id}, {"created_at": 0, "updated_at": 0}
     )
+    links = await cursor.to_list(None)
+    return [
+        (
+            link["_id"],
+            link["text_channel_id"],
+            link["voice_channel_id"],
+            link.get("role_id"),
+        )
+        for link in links
+    ]
 
-    links = cursor.fetchall()
-    conn.close()
 
-    return links
-
-
-def set_custom_message(guild_id, msg_type, message):
-    """Set a custom message for a specific guild and type (join/leave/move).
-    If message is None, it will remove the custom message and revert to default."""
+async def set_custom_message(guild_id, msg_type, message):
+    """Set a custom message for a specific guild and type (join/leave/move)."""
     if msg_type not in ["join", "leave", "move"]:
         raise ValueError("Message type must be 'join', 'leave', or 'move'")
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    db = Database.get_instance()
+    now = datetime.utcnow()
 
     if message is None:
         # Remove the custom message to revert to default
-        cursor.execute(
-            """
-            DELETE FROM custom_messages
-            WHERE guild_id = ? AND type = ?
-            """,
-            (guild_id, msg_type),
-        )
+        await db.custom_messages.delete_one({"guild_id": guild_id, "type": msg_type})
     else:
-        cursor.execute(
-            """
-            INSERT INTO custom_messages (guild_id, type, message)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, type)
-            DO UPDATE SET message = excluded.message
-            """,
-            (guild_id, msg_type, message),
+        await db.custom_messages.update_one(
+            {"guild_id": guild_id, "type": msg_type},
+            {
+                "$set": {"message": message, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
         )
 
-    conn.commit()
-    conn.close()
 
-
-def get_custom_message(guild_id, msg_type):
+async def get_custom_message(guild_id, msg_type):
     """Get a custom message for a specific guild and type."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT message
-        FROM custom_messages
-        WHERE guild_id = ? AND type = ?
-        """,
-        (guild_id, msg_type),
+    db = Database.get_instance()
+    result = await db.custom_messages.find_one(
+        {"guild_id": guild_id, "type": msg_type},
+        {"_id": 0, "created_at": 0, "updated_at": 0},
     )
-
-    result = cursor.fetchone()
-    conn.close()
-
-    return result[0] if result else None
+    return result["message"] if result else None

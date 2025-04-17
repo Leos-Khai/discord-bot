@@ -12,13 +12,13 @@ class OnReady(commands.Cog):
 
         # Retroactively check for servers
         print("Checking for missing servers in the database...")
-        stored_servers = {server[1] for server in get_servers()}
+        stored_servers = {server["server_id"] for server in await get_servers()}
         current_servers = {str(guild.id) for guild in self.bot.guilds}
 
         missing_servers = current_servers - stored_servers
 
         for server_id in missing_servers:
-            add_server(server_id)
+            await add_server(server_id)
             print(f"Added missing server: {server_id}")
 
         print("Retroactive server check complete.")

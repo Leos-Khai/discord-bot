@@ -29,7 +29,7 @@ class Admin(commands.Cog):
     @is_admin()
     async def list_links(self, ctx):
         """List all channel links for the guild."""
-        links = get_channel_links_by_guild(str(ctx.guild.id))
+        links = await get_channel_links_by_guild(str(ctx.guild.id))
 
         if not links:
             await ctx.send("No channel links found.")
@@ -63,19 +63,9 @@ class Admin(commands.Cog):
         voice_channel_name: str,
         role: discord.Role = None,
     ):
-        """!link_channel - Link a text channel, voice channel, and optional
-        role.
-
-        Usage:
-        !link_channel #channel "voice channel name" @role
-        voice channel name - Can use quotation for multi word names.
-        @role - Optional
-        """
-
         guild_id = str(ctx.guild.id)
         text_channel_id = str(text_channel.id)
 
-        # Search for the voice channel by name
         voice_channel = discord.utils.get(
             ctx.guild.voice_channels, name=voice_channel_name
         )
@@ -88,7 +78,7 @@ class Admin(commands.Cog):
         role_id = str(role.id) if role else None
 
         try:
-            add_channel_link(guild_id, text_channel_id, voice_channel_id, role_id)
+            await add_channel_link(guild_id, text_channel_id, voice_channel_id, role_id)
 
             # Set default messages for the new link
             default_messages = {
@@ -98,7 +88,7 @@ class Admin(commands.Cog):
             }
 
             for msg_type, msg in default_messages.items():
-                set_custom_message(guild_id, msg_type, msg)
+                await set_custom_message(guild_id, msg_type, msg)
 
             await ctx.send(
                 f"Linked {text_channel.mention} to {voice_channel.name}{' with role ' + role.mention if role else ''}.\n"
@@ -112,15 +102,7 @@ class Admin(commands.Cog):
     )
     @is_admin()
     async def remove_channel(self, ctx):
-        """!remove_channel - List and remove a channel link.
-
-        Usage:
-        !remove_channel
-        A list of links will appear.
-        Type in the index and hit send. It will be removed. It has a 30 second
-        time limit.
-        """
-        links = get_channel_links_by_guild(str(ctx.guild.id))
+        links = await get_channel_links_by_guild(str(ctx.guild.id))
 
         if not links:
             await ctx.send("No channel links found.")
@@ -155,7 +137,7 @@ class Admin(commands.Cog):
             choice = int(msg.content) - 1
             if 0 <= choice < len(links):
                 link_id = links[choice][0]
-                remove_channel_link(link_id)
+                await remove_channel_link(link_id)
                 await ctx.send("Channel link removed successfully.")
             else:
                 await ctx.send("Invalid choice.")
@@ -170,7 +152,6 @@ class Admin(commands.Cog):
     async def update_channel(
         self, ctx, voice_channel_name: str, new_text_channel: discord.TextChannel
     ):
-        """Update the text channel for a given voice channel."""
         voice_channel = discord.utils.get(
             ctx.guild.voice_channels, name=voice_channel_name
         )
@@ -182,7 +163,7 @@ class Admin(commands.Cog):
         voice_channel_id = str(voice_channel.id)
         new_text_channel_id = str(new_text_channel.id)
 
-        if update_channel_link_text(voice_channel_id, new_text_channel_id):
+        if await update_channel_link_text(voice_channel_id, new_text_channel_id):
             await ctx.send(
                 f"Updated {voice_channel.name} to use text channel {new_text_channel.mention}."
             )
@@ -196,7 +177,6 @@ class Admin(commands.Cog):
     async def update_role(
         self, ctx, voice_channel_name: str, new_role: discord.Role = None
     ):
-        """Update the role for a given voice channel."""
         voice_channel = discord.utils.get(
             ctx.guild.voice_channels, name=voice_channel_name
         )
@@ -208,7 +188,7 @@ class Admin(commands.Cog):
         voice_channel_id = str(voice_channel.id)
         new_role_id = str(new_role.id) if new_role else None
 
-        if update_channel_link_role(voice_channel_id, new_role_id):
+        if await update_channel_link_role(voice_channel_id, new_role_id):
             await ctx.send(
                 f"Updated {voice_channel.name} to use role {new_role.mention if new_role else 'None'}."
             )
@@ -220,7 +200,6 @@ class Admin(commands.Cog):
     )
     @is_admin()
     async def remove_role(self, ctx, voice_channel_name: str):
-        """Remove the role from a link with the given voice channel name."""
         voice_channel = discord.utils.get(
             ctx.guild.voice_channels, name=voice_channel_name
         )
@@ -231,7 +210,7 @@ class Admin(commands.Cog):
 
         voice_channel_id = str(voice_channel.id)
 
-        if update_channel_link_role(voice_channel_id, None):
+        if await update_channel_link_role(voice_channel_id, None):
             await ctx.send(f"Removed role from {voice_channel.name}.")
         else:
             await ctx.send("No link found for the specified voice channel.")
@@ -257,7 +236,6 @@ Example: !set_message reset all (Resets all messages to default)
     )
     @is_admin()
     async def set_message(self, ctx, msg_type: str, *, message: str = None):
-        """Set a custom notification message for voice channel events."""
         msg_type = msg_type.lower()
 
         if msg_type == "reset":
@@ -271,11 +249,11 @@ Example: !set_message reset all (Resets all messages to default)
             if message == "all":
                 # Reset all message types
                 for type_to_reset in ["join", "leave", "move"]:
-                    set_custom_message(str(ctx.guild.id), type_to_reset, None)
+                    await set_custom_message(str(ctx.guild.id), type_to_reset, None)
                 await ctx.send("All message types have been reset to default.")
             else:
                 # Reset specific message type
-                set_custom_message(str(ctx.guild.id), message, None)
+                await set_custom_message(str(ctx.guild.id), message, None)
                 await ctx.send(
                     f"Message for {message} events has been reset to default."
                 )
@@ -286,17 +264,16 @@ Example: !set_message reset all (Resets all messages to default)
             return
 
         try:
-            set_custom_message(str(ctx.guild.id), msg_type, message)
+            await set_custom_message(str(ctx.guild.id), msg_type, message)
             await ctx.send(f"Successfully set custom message for {msg_type} events.")
         except ValueError as e:
             await ctx.send(str(e))
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx, error):
-        """Handle errors for the cog."""
         if isinstance(error, commands.CheckFailure):
             await ctx.send("You do not have permission to use this command.")
-            return  # Stop further propagation
+            return
         else:
             raise error
 
