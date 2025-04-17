@@ -1,4 +1,8 @@
 {
   "token": "NzAwNjY2NzY2NzA3MTMwNDI5.Gc5y9J.KflH6_xGbTerVJoiWPI7yD2X4o2FLJCxcayL5c",
-  "prefix": "!"
+  "prefix": "!",
+  "mongodb": {
+    "uri": "mongodb://localhost:27017",
+    "database": "discord_bot"
+  }
 }
