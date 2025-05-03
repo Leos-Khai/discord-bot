@@ -26,8 +26,8 @@ def replace_tokens(
         message = f"{role.mention} {message}"
 
     replacements = {
-        "$USER": member.display_name,
         "$USERNAME": member.name,
+        "$USER": member.display_name,
         "$NICKNAME": member.nick or member.display_name,
         "$MENTION": member.mention,
         "$CHANNEL": channel.name if channel else "",
