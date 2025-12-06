@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import aiohttp
 import discord
@@ -112,35 +112,69 @@ class Notifications(commands.Cog):
             for i in range(0, len(streamers), 100):
                 batch = streamers[i : i + 100]
                 streams = await self._get_twitch_streams(batch)
+                stream_lookup: Dict[str, dict] = {
+                    stream["user_login"]: stream for stream in streams
+                }
 
-                for sub in subscriptions:
+                batch_subscriptions = [
+                    sub for sub in subscriptions if sub["twitch_username"] in batch
+                ]
+                for sub in batch_subscriptions:
                     username = sub["twitch_username"]
                     guild_id = sub["guild_id"]
                     notification_channel_id = sub["notification_channel_id"]
 
-                    current_stream = next(
-                        (s for s in streams if s["user_login"] == username.lower()),
-                        None,
-                    )
-                    was_live = await get_stream_status(guild_id, username)
+                    current_stream = stream_lookup.get(username.lower())
+                    state = await get_stream_status(guild_id, username)
+                    was_live = state.get("is_live", False)
                     notification_channel = self.bot.get_channel(
                         int(notification_channel_id)
                     )
 
                     if current_stream and not was_live:
+                        message_id = None
                         if notification_channel:
-                            await self._send_twitch_notification(
+                            message_id = await self._send_twitch_notification(
                                 notification_channel, current_stream, "live"
                             )
                         await update_stream_status(
-                            guild_id, username, True, current_stream["id"]
+                            guild_id,
+                            username,
+                            True,
+                            current_stream["id"],
+                            message_id=message_id,
+                            user_id=current_stream.get("user_id"),
+                            user_login=current_stream.get("user_login"),
+                            display_name=current_stream.get("user_name"),
                         )
                     elif not current_stream and was_live:
+                        offline_payload = {
+                            "user_name": state.get("display_name")
+                            or sub.get("display_name")
+                            or username,
+                            "display_name": state.get("display_name")
+                            or sub.get("display_name")
+                            or username,
+                            "user_login": state.get("user_login") or username,
+                            "user_id": state.get("user_id"),
+                            "stream_id": state.get("stream_id"),
+                            "message_id": state.get("message_id"),
+                        }
+                        message_id = offline_payload["message_id"]
                         if notification_channel:
-                            await self._send_twitch_notification(
-                                notification_channel, {"user_name": username}, "offline"
+                            message_id = await self._send_twitch_notification(
+                                notification_channel, offline_payload, "offline"
                             )
-                        await update_stream_status(guild_id, username, False, None)
+                        await update_stream_status(
+                            guild_id,
+                            username,
+                            False,
+                            None,
+                            message_id=message_id,
+                            user_id=offline_payload["user_id"],
+                            user_login=offline_payload["user_login"],
+                            display_name=offline_payload["display_name"],
+                        )
         except Exception as e:
             self.logger.error(f"Error checking Twitch: {e}")
 
@@ -227,6 +261,57 @@ class Notifications(commands.Cog):
                     return []
                 streams_data = await resp.json()
                 return streams_data.get("data", [])
+
+    async def _get_twitch_vod_url(
+        self, user_id: Optional[str], stream_id: Optional[str], user_login: Optional[str]
+    ) -> Optional[str]:
+        """Return the VOD URL for the most recent stream, preferring a VOD that matches the stream_id."""
+        token = await self.get_twitch_token()
+        if not token:
+            return None
+
+        # Resolve user_id if we only have the login.
+        resolved_user_id = user_id
+        if not resolved_user_id and user_login:
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Client-ID": self.twitch_client_id,
+                    "Authorization": f"Bearer {token}",
+                }
+                url = "https://api.twitch.tv/helix/users"
+                params = {"login": user_login}
+                async with session.get(url, headers=headers, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not data.get("data"):
+                        return None
+                    resolved_user_id = data["data"][0]["id"]
+
+        if not resolved_user_id:
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Client-ID": self.twitch_client_id,
+                "Authorization": f"Bearer {token}",
+            }
+            params = {"user_id": resolved_user_id, "type": "archive", "first": 5}
+            async with session.get(
+                "https://api.twitch.tv/helix/videos", headers=headers, params=params
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+
+        videos = data.get("data", [])
+        for video in videos:
+            if stream_id and video.get("stream_id") == stream_id:
+                return video.get("url")
+
+        if videos:
+            return videos[0].get("url")
+        return None
 
     async def get_twitch_token(self):
         """Get OAuth token for Twitch API (cached until process restarts)."""
@@ -337,14 +422,26 @@ class Notifications(commands.Cog):
 
     async def _send_twitch_notification(
         self, channel: discord.TextChannel, stream_data: dict, status: str
-    ):
+    ) -> Optional[str]:
         if status == "live":
+            started_at = stream_data.get("started_at")
+            timestamp = None
+            if started_at:
+                try:
+                    timestamp = datetime.fromisoformat(
+                        started_at.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    timestamp = None
+
             embed = discord.Embed(
                 title=stream_data.get("title", "Live Stream"),
                 url=f"https://twitch.tv/{stream_data['user_login']}",
                 color=0x9146FF,
+                timestamp=timestamp,
             )
             embed.set_author(name=f"{stream_data['user_name']} is now live on Twitch!")
+            embed.description = f"[Watch Stream](https://twitch.tv/{stream_data['user_login']})"
             embed.add_field(
                 name="Game", value=stream_data.get("game_name", "Unknown"), inline=True
             )
@@ -353,13 +450,51 @@ class Notifications(commands.Cog):
             )
             thumbnail = stream_data.get("thumbnail_url")
             if thumbnail:
-                embed.set_image(url=thumbnail.replace("{width}", "320").replace("{height}", "180"))
+                embed.set_image(
+                    url=thumbnail.replace("{width}", "320").replace("{height}", "180")
+                )
             embed.set_footer(text="Twitch")
-        else:
-            embed = discord.Embed(title="Stream Ended", color=0x9146FF)
-            embed.set_author(name=f"{stream_data['user_name']} has gone offline")
-            embed.set_footer(text="Twitch")
-        await channel.send(embed=embed)
+            message = await channel.send(embed=embed)
+            return str(message.id)
+
+        user_login = (
+            stream_data.get("user_login")
+            or stream_data.get("username")
+            or stream_data.get("user_name")
+        )
+        display_name = stream_data.get("display_name") or stream_data.get("user_name")
+        vod_url = await self._get_twitch_vod_url(
+            stream_data.get("user_id"), stream_data.get("stream_id"), user_login
+        )
+        link_target = vod_url or (f"https://twitch.tv/{user_login}" if user_login else None)
+        link_label = "Watch VOD" if vod_url else "Visit Channel"
+
+        embed = discord.Embed(
+            title="Stream Ended",
+            url=link_target,
+            color=0x9146FF,
+        )
+        if display_name or user_login:
+            embed.set_author(
+                name=f"{display_name or user_login} has gone offline"
+            )
+        if link_target:
+            embed.description = f"[{link_label}]({link_target})"
+        embed.set_footer(text="Twitch")
+
+        message_id = stream_data.get("message_id")
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+                await message.edit(embed=embed)
+                return str(message.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError) as e:
+                self.logger.warning(
+                    f"Could not edit prior Twitch notification ({message_id}): {e}"
+                )
+
+        message = await channel.send(embed=embed)
+        return str(message.id)
 
     # --- Commands ---------------------------------------------------------
     @commands.group(

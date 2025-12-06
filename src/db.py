@@ -372,12 +372,29 @@ class DatabaseService:
         cursor = self.twitch_subscriptions.find({"guild_id": guild_id})
         return await cursor.to_list(None)
 
-    async def get_stream_status(self, guild_id: str, twitch_username: str) -> bool:
+    async def get_stream_status(
+        self, guild_id: str, twitch_username: str
+    ) -> Dict[str, Any]:
         doc = await self.twitch_stream_status.find_one(
             {"guild_id": guild_id, "twitch_username": twitch_username.lower()},
-            {"_id": 0, "is_live": 1},
+            {"_id": 0},
         )
-        return doc.get("is_live", False) if doc else False
+        if not doc:
+            return {
+                "is_live": False,
+                "stream_id": None,
+                "message_id": None,
+                "user_id": None,
+                "user_login": twitch_username.lower(),
+                "display_name": None,
+            }
+        doc.setdefault("is_live", False)
+        doc.setdefault("stream_id", None)
+        doc.setdefault("message_id", None)
+        doc.setdefault("user_id", None)
+        doc.setdefault("user_login", twitch_username.lower())
+        doc.setdefault("display_name", None)
+        return doc
 
     async def update_stream_status(
         self,
@@ -385,16 +402,25 @@ class DatabaseService:
         twitch_username: str,
         is_live: bool,
         stream_id: Optional[str],
+        message_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_login: Optional[str] = None,
+        display_name: Optional[str] = None,
     ) -> None:
         now = datetime.utcnow()
+        set_fields = {
+            "is_live": is_live,
+            "stream_id": stream_id,
+            "message_id": message_id,
+            "user_id": user_id,
+            "user_login": user_login.lower() if user_login else None,
+            "display_name": display_name,
+            "updated_at": now,
+        }
         await self.twitch_stream_status.update_one(
             {"guild_id": guild_id, "twitch_username": twitch_username.lower()},
             {
-                "$set": {
-                    "is_live": is_live,
-                    "stream_id": stream_id,
-                    "updated_at": now,
-                },
+                "$set": set_fields,
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
@@ -593,7 +619,23 @@ async def get_stream_status(guild_id: str, twitch_username: str):
     return await _db_service.get_stream_status(guild_id, twitch_username)
 
 
-async def update_stream_status(guild_id: str, twitch_username: str, is_live: bool, stream_id=None):
+async def update_stream_status(
+    guild_id: str,
+    twitch_username: str,
+    is_live: bool,
+    stream_id=None,
+    message_id=None,
+    user_id=None,
+    user_login=None,
+    display_name=None,
+):
     return await _db_service.update_stream_status(
-        guild_id, twitch_username, is_live, stream_id
+        guild_id,
+        twitch_username,
+        is_live,
+        stream_id,
+        message_id=message_id,
+        user_id=user_id,
+        user_login=user_login,
+        display_name=display_name,
     )
