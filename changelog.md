@@ -1,8 +1,12 @@
 # Changelog
 
 ## Unreleased
-- Added per-guild music channel limits; music commands now respect allowed text channels via `!music_channels` admin group (`list`/default, `add`, `remove`, `clear`).
-- Persist allowed channels in Mongo (`music_channel_limits` collection) and cache in the music cog for fast checks.
+- Notifications overhaul:
+  - YouTube: `!notifications youtube add` accepts channel URLs/@handles/IDs, stores channel titles, and lists entries with human-readable names and target channels. Duplicate-video suppression via `notified_videos` kept.
+  - Twitch: `!notifications twitch add` accepts profile URLs/usernames, stores display names, and lists entries with display + username and target channels. Uses client-credentials auth only.
+  - Notification channel per subscription or default via `!notifications channel`.
+- DB layer refactor: service class with typed helpers for servers, links, custom messages, music limits, notification channels, YouTube/Twitch subscriptions, and stream status; env-first Mongo config.
+- Music command gating: per-guild channel limits via `!music_channels` (list/add/remove/clear) persisted in Mongo with cog caching.
 
 ## e8a20c8 — docs: add repository guidelines
 - Added contributor guide `AGENTS.md` with structure, commands, and security practices.
