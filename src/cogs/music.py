@@ -9,6 +9,7 @@ from cogs.admin import is_admin
 import functools
 from logger import get_logger
 import asyncio
+from db import get_music_channels
 
 youtube_dl.utils.bug_reports_message = lambda *args, **kwargs: ""
 
@@ -66,6 +67,38 @@ class MusicCommands(commands.Cog):
         self.playback_start_time = {}
         self.playback_seek_position = {}
         self.pause_start_time = {}
+        self.allowed_channels_cache = {}
+
+    async def _get_allowed_channels(self, guild_id: str):
+        """Fetch allowed text channels for music commands, cached per guild."""
+        if guild_id in self.allowed_channels_cache:
+            return self.allowed_channels_cache[guild_id]
+        channels = await get_music_channels(guild_id)
+        allowed_set = {int(cid) for cid in channels}
+        self.allowed_channels_cache[guild_id] = allowed_set
+        return allowed_set
+
+    async def refresh_allowed_channels_cache(self, guild_id: str):
+        """Refresh allowed channel cache after admin updates."""
+        if guild_id in self.allowed_channels_cache:
+            self.allowed_channels_cache.pop(guild_id, None)
+        await self._get_allowed_channels(guild_id)
+
+    async def cog_check(self, ctx):
+        """Restrict music commands to allowed channels if configured."""
+        if not ctx.guild:
+            return False
+        allowed_channels = await self._get_allowed_channels(str(ctx.guild.id))
+        if allowed_channels and ctx.channel.id not in allowed_channels:
+            mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
+            await ctx.send(f"Music commands are limited to: {mentions}")
+            return False
+        return True
+
+    async def cog_command_error(self, ctx, error):
+        if isinstance(error, commands.CheckFailure):
+            return
+        raise error
 
     def get_guild_queue(self, gid):
         if gid not in self.queues:

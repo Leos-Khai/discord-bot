@@ -31,6 +31,7 @@ class Database:
         self.servers = self.db.servers
         self.channel_links = self.db.channel_links
         self.custom_messages = self.db.custom_messages
+        self.music_channel_limits = self.db.music_channel_limits
 
 
 async def initialize_database():
@@ -40,6 +41,7 @@ async def initialize_database():
     # Create indexes
     await db.channel_links.create_index("voice_channel_id", unique=True)
     await db.custom_messages.create_index([("guild_id", 1), ("type", 1)], unique=True)
+    await db.music_channel_limits.create_index("guild_id", unique=True)
 
 
 async def add_server(server_id: str):
@@ -169,3 +171,64 @@ async def get_custom_message(guild_id, msg_type):
         {"_id": 0, "created_at": 0, "updated_at": 0},
     )
     return result["message"] if result else None
+
+
+# Music channel limit helpers
+async def get_music_channels(guild_id):
+    """Return list of text channel IDs allowed for music commands in a guild."""
+    db = Database.get_instance()
+    doc = await db.music_channel_limits.find_one(
+        {"guild_id": guild_id}, {"_id": 0, "channel_ids": 1}
+    )
+    return doc.get("channel_ids", []) if doc else []
+
+
+async def set_music_channels(guild_id, channel_ids):
+    """Set the allowed music command channels for a guild."""
+    db = Database.get_instance()
+    now = datetime.utcnow()
+    unique_channels = list({str(cid) for cid in channel_ids})
+    await db.music_channel_limits.update_one(
+        {"guild_id": guild_id},
+        {
+            "$set": {"channel_ids": unique_channels, "updated_at": now},
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    return unique_channels
+
+
+async def add_music_channel(guild_id, channel_id):
+    """Add a single text channel to the allowed list."""
+    db = Database.get_instance()
+    now = datetime.utcnow()
+    await db.music_channel_limits.update_one(
+        {"guild_id": guild_id},
+        {
+            "$addToSet": {"channel_ids": str(channel_id)},
+            "$set": {"updated_at": now},
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    return await get_music_channels(guild_id)
+
+
+async def remove_music_channel(guild_id, channel_id):
+    """Remove a text channel from the allowed list; clears doc if empty."""
+    db = Database.get_instance()
+    await db.music_channel_limits.update_one(
+        {"guild_id": guild_id}, {"$pull": {"channel_ids": str(channel_id)}}
+    )
+    remaining = await get_music_channels(guild_id)
+    if not remaining:
+        await db.music_channel_limits.delete_one({"guild_id": guild_id})
+    return remaining
+
+
+async def clear_music_channels(guild_id):
+    """Remove all music channel limits for a guild."""
+    db = Database.get_instance()
+    await db.music_channel_limits.delete_one({"guild_id": guild_id})
+    return []
