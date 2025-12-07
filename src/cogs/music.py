@@ -147,6 +147,35 @@ class MusicCommands(commands.Cog):
 
         return seek_pos + elapsed_time
 
+    async def _start_track(self, ctx, gid: str, track: dict, announce: bool = True):
+        """Start playback for a prepared track and update state."""
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_connected():
+            raise RuntimeError("Voice client unavailable for playback.")
+
+        if not track or "url" not in track:
+            raise ValueError("Track is missing stream URL.")
+
+        volume = self.volumes.get(gid, 1.0)
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS),
+            volume=volume,
+        )
+
+        def _after(error_arg):
+            self.handle_after_play(error_arg, ctx, gid)
+
+        vc.play(source, after=_after)
+
+        loop = self.bot.loop
+        self.playback_start_time[gid] = loop.time()
+        self.playback_seek_position[gid] = 0.0
+        self.pause_start_time.pop(gid, None)
+        self.current_tracks[gid] = track
+
+        if announce and ctx and ctx.channel:
+            await ctx.send(f"Now playing: **{track.get('title', 'Unknown')}**")
+
     async def _fetch_track_info(self, url_or_id):
         """Fetches full track info for a single URL or ID. Runs in executor."""
         loop = self.bot.loop
@@ -224,23 +253,7 @@ class MusicCommands(commands.Cog):
                         )
                         if fresh_track and "url" in fresh_track:
                             next_track["url"] = fresh_track["url"]
-
-                    source = discord.PCMVolumeTransformer(
-                        discord.FFmpegPCMAudio(next_track["url"], **FFMPEG_OPTIONS),
-                        volume=volume,
-                    )
-
-                    def _after_play_next(error_arg):
-                        self.handle_after_play(error_arg, ctx, gid)
-
-                    vc.play(source, after=_after_play_next)
-                    loop = self.bot.loop
-                    self.playback_start_time[gid] = loop.time()
-                    self.playback_seek_position[gid] = 0.0
-                    self.pause_start_time.pop(gid, None)
-                    self.current_tracks[gid] = next_track
-                    if ctx and ctx.channel:
-                        await ctx.send(f"Now playing: **{next_track['title']}**")
+                    await self._start_track(ctx, gid, next_track, announce=True)
                     break  # Success, exit retry loop
 
                 except Exception as e:
@@ -325,307 +338,69 @@ class MusicCommands(commands.Cog):
         return True
 
     @commands.command(
-        help="Join a voice channel.\nUsage: !join\nMust be in a voice channel to use this command."
+        help="Have the bot join your current voice channel without starting playback.\nUsage: !join"
     )
     async def join(self, ctx):
-        if not ctx.author.voice:
-            await ctx.send("You are not connected to a voice channel.")
+        if not await self._ensure_voice(ctx):
             return
-        await self._ensure_voice(ctx)
+        # If we were already in the user's channel, give a quick confirmation.
+        if (
+            ctx.voice_client
+            and ctx.author.voice
+            and ctx.voice_client.channel == ctx.author.voice.channel
+        ):
+            await ctx.send(f"Already in **{ctx.voice_client.channel.name}**.")
 
     @commands.command(
-        help="Play music from YouTube or search.\nUsage: !play <URL or Search Query>\nSupports videos, playlists, and search terms.\nExample: !play never gonna give you up"
+        help="Play a YouTube URL or search query.\nUsage: !play <url|search terms>\nAutomatically joins your voice channel."
     )
-    async def play(self, ctx, *, query_or_url: str):
-        if not ctx.voice_client:
-            if ctx.author.voice:
-                if not await self._ensure_voice(ctx):
-                    return
-            else:
-                await ctx.send("You must be in a voice channel to play audio.")
-                return
-        elif not await self._ensure_voice(ctx):
+    async def play(self, ctx, *, query: str):
+        if not query:
+            await ctx.send("Please provide a URL or search terms to play.")
             return
 
-        url_pattern = re.compile(r"https?://[^\s/$.?#].[^\s]*")
-        is_url = url_pattern.match(query_or_url)
-        url_to_process = query_or_url
-
-        if not is_url:
-            await ctx.send(f"🔍 Searching for '{query_or_url}'...")
-            loop = self.bot.loop
-            try:
-                ydl_opts_search = YDL_OPTIONS.copy()
-                ydl_opts_search["noplaylist"] = True
-                ydl_opts_search["socket_timeout"] = 30
-                ydl = youtube_dl.YoutubeDL(ydl_opts_search)
-
-                search_info = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            ydl.extract_info,
-                            f"ytsearch1:{query_or_url}",
-                            download=False,
-                        ),
-                    ),
-                    timeout=30.0,
-                )
-
-                entries = search_info.get("entries", [])
-                if not entries:
-                    await ctx.send(f"❌ No results found for '{query_or_url}'.")
-                    return
-                first_result = entries[0]
-                url_to_process = first_result.get("webpage_url") or first_result.get(
-                    "url"
-                )
-                if not url_to_process:
-                    await ctx.send(
-                        f"❌ Could not find a playable URL for the top result of '{query_or_url}'."
-                    )
-                    return
-                await ctx.send(
-                    f"✅ Found: **{first_result.get('title', 'Unknown Title')}**. Processing..."
-                )
-            except asyncio.TimeoutError:
-                await ctx.send(f"⏰ Search timed out for '{query_or_url}'.")
-                return
-            except Exception as e:
-                await ctx.send(f"❌ Error during search: {e}")
-                self.logger.error(
-                    f"Error processing implicit search '{query_or_url}': {e}"
-                )
-                return
-        else:
-            await ctx.send(f"🔄 Processing URL...")
-
-        loop = self.bot.loop
-        try:
-            ydl_opts_flat = YDL_OPTIONS.copy()
-            ydl_opts_flat["extract_flat"] = "in_playlist"
-            ydl_opts_flat["socket_timeout"] = 30
-            ydl = youtube_dl.YoutubeDL(ydl_opts_flat)
-
-            info = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    functools.partial(ydl.extract_info, url_to_process, download=False),
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ Request timed out while processing the URL.")
-            return
-        except youtube_dl.utils.DownloadError as e:
-            await ctx.send(f"❌ Error processing the URL: {e}")
-            self.logger.error(f"Error processing URL/Query '{query_or_url}': {e}")
-            return
-        except Exception as e:
-            await ctx.send(f"❌ An unexpected error occurred while processing the URL.")
-            self.logger.error(
-                f"Unexpected error processing URL/Query '{query_or_url}': {e}"
-            )
+        if not await self._ensure_voice(ctx):
             return
 
         gid = str(ctx.guild.id)
         queue = self.get_guild_queue(gid)
-        volume = self.volumes.get(gid, 1.0)
-        loading_queue = self.loading_queues[gid]
-        loading_lock = self.loading_locks[gid]
-        play_next_event = self.play_next_events[gid]
 
-        if "entries" in info and info.get("_type") == "playlist":
-            entries = info["entries"]
-            if not entries:
-                await ctx.send("❌ No videos found in the playlist.")
-                return
+        target = query.strip()
+        is_url = re.match(r"https?://", target)
+        ydl_target = target if is_url else f"ytsearch1:{target}"
 
-            valid_entries = [entry for entry in entries if entry and entry.get("url")]
-            if not valid_entries:
-                await ctx.send("❌ Playlist contains no valid video URLs.")
-                return
-
-            first_entry_url = valid_entries[0]["url"]
-            remaining_entry_urls = [entry["url"] for entry in valid_entries[1:]]
-
-            if not ctx.voice_client.is_playing():
-                try:
-                    first_track_info = await self._fetch_track_info(first_entry_url)
-                    if first_track_info:
-                        try:
-                            source = discord.PCMVolumeTransformer(
-                                discord.FFmpegPCMAudio(
-                                    first_track_info["url"], **FFMPEG_OPTIONS
-                                ),
-                                volume=volume,
-                            )
-
-                            def _after_playlist_first(error_arg):
-                                self.handle_after_play(error_arg, ctx, gid)
-
-                            ctx.voice_client.play(source, after=_after_playlist_first)
-                            loop = self.bot.loop
-                            self.playback_start_time[gid] = loop.time()
-                            self.playback_seek_position[gid] = 0.0
-                            self.pause_start_time.pop(gid, None)
-                            self.current_tracks[gid] = first_track_info
-                            await ctx.send(
-                                f"▶️ Now playing: **{first_track_info['title']}**"
-                            )
-                        except Exception as e:
-                            await ctx.send(
-                                f"❌ Error starting playback for the first track: {e}"
-                            )
-                            self.logger.error(
-                                f"Error playing first track {first_track_info.get('title', 'N/A')}: {e}"
-                            )
-                            remaining_entry_urls.insert(0, first_entry_url)
-                    else:
-                        await ctx.send(
-                            "❌ Error fetching details for the first track of the playlist."
-                        )
-                        remaining_entry_urls.insert(0, first_entry_url)
-                except Exception as e:
-                    await ctx.send(f"❌ Error processing first track: {e}")
-                    remaining_entry_urls.insert(0, first_entry_url)
-
-                async with loading_lock:
-                    loading_queue.extend(remaining_entry_urls)
-
-                if remaining_entry_urls:
-                    await ctx.send(
-                        f"⏳ Loading {len(remaining_entry_urls)} more track(s) in the background..."
-                    )
-                if gid not in self.loading_tasks or self.loading_tasks[gid].done():
-                    self.loading_tasks[gid] = asyncio.create_task(
-                        self._background_loader(ctx, gid)
-                    )
-
-            else:
-                all_entry_urls = [entry["url"] for entry in valid_entries]
-                async with loading_lock:
-                    loading_queue.extend(all_entry_urls)
-                await ctx.send(
-                    f"➕ Added {len(all_entry_urls)} track(s) to the loading queue..."
-                )
-                if gid not in self.loading_tasks or self.loading_tasks[gid].done():
-                    self.loading_tasks[gid] = asyncio.create_task(
-                        self._background_loader(ctx, gid)
-                    )
-
-        else:
-            try:
-                single_track_info = await self._fetch_track_info(url_to_process)
-                if not single_track_info:
-                    await ctx.send(
-                        f"❌ Could not fetch details or find playable audio for the requested URL."
-                    )
-                    return
-
-                track = single_track_info
-                if ctx.voice_client.is_playing():
-                    queue.append(track)
-                    await ctx.send(f"➕ Added to queue: **{track['title']}**")
-                else:
-                    try:
-                        source = discord.PCMVolumeTransformer(
-                            discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS),
-                            volume=volume,
-                        )
-
-                        def _after_single_play(error_arg):
-                            self.handle_after_play(error_arg, ctx, gid)
-
-                        ctx.voice_client.play(source, after=_after_single_play)
-                        loop = self.bot.loop
-                        self.playback_start_time[gid] = loop.time()
-                        self.playback_seek_position[gid] = 0.0
-                        self.pause_start_time.pop(gid, None)
-                        self.current_tracks[gid] = track
-                        await ctx.send(f"▶️ Now playing: **{track['title']}**")
-                    except Exception as e:
-                        await ctx.send(f"❌ Error starting playback: {e}")
-                        self.logger.error(
-                            f"Error playing single track {track.get('title', 'N/A')}: {e}"
-                        )
-            except Exception as e:
-                await ctx.send(f"❌ Error processing track: {e}")
-                self.logger.error(f"Error in single track processing: {e}")
-
-    async def _background_loader(self, ctx, gid):
-        """Processes URLs from the loading queue and adds them to the main queue."""
-        loading_queue = self.loading_queues.get(gid, [])
-        loading_lock = self.loading_locks.get(gid)
-        play_next_event = self.play_next_events.get(gid)
-        queue = self.queues.get(gid)
-
-        if not loading_lock or not play_next_event or queue is None:
+        try:
+            track_info = await self._fetch_track_info(ydl_target)
+        except Exception as e:
+            await ctx.send(f"❌ Unable to fetch track: {e}")
             self.logger.error(
-                f"Background loader for GID {gid} missing required structures."
+                f"Failed to fetch track for '{query}' in GID {gid}: {e}"
             )
             return
 
-        self.logger.info(f"Background loader started for GID {gid}.")
-        processed_count = 0
-        error_count = 0
+        if not track_info or "url" not in track_info:
+            await ctx.send("❌ Couldn't find a playable audio source for that request.")
+            return
 
-        while True:
-            url_to_process = None
+        track = {
+            "title": track_info.get("title") or "Unknown Title",
+            "url": track_info.get("url"),
+            "duration": track_info.get("duration"),
+            "webpage_url": track_info.get("webpage_url") or track_info.get("url"),
+        }
+
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            queue.append(track)
+            await ctx.send(f"➕ Added to queue: **{track['title']}**")
+        else:
             try:
-                if gid not in self.queues:
-                    self.logger.info(
-                        f"Background loader for GID {gid} stopping as queues were cleared."
-                    )
-                    break
-
-                async with loading_lock:
-                    if loading_queue:
-                        url_to_process = loading_queue.pop(0)
-                    else:
-                        break
+                await self._start_track(ctx, gid, track, announce=False)
+                await ctx.send(f"▶️ Now playing: **{track['title']}**")
             except Exception as e:
+                await ctx.send(f"❌ Error starting playback: {e}")
                 self.logger.error(
-                    f"Error accessing loading queue/lock for GID {gid}: {e}"
+                    f"Error starting playback for {track.get('title', 'N/A')} in GID {gid}: {e}"
                 )
-                break
-
-            if url_to_process:
-                try:
-                    track_info = await self._fetch_track_info(url_to_process)
-                    if track_info:
-                        if gid in self.queues:
-                            queue.append(track_info)
-                            processed_count += 1
-                            play_next_event.set()
-                            play_next_event.clear()
-                        else:
-                            self.logger.info(
-                                f"Background loader for GID {gid} stopping mid-process as queues were cleared."
-                            )
-                            break
-                    else:
-                        error_count += 1
-                        self.logger.warning(
-                            f"Failed to fetch info for {url_to_process} in background loader for GID {gid}."
-                        )
-                except Exception as e:
-                    error_count += 1
-                    self.logger.warning(
-                        f"Exception fetching info for {url_to_process} in background loader for GID {gid}: {e}"
-                    )
-
-            await asyncio.sleep(0.1)
-
-        self.logger.info(
-            f"Background loader finished for GID {gid}. Processed: {processed_count}, Errors: {error_count}."
-        )
-
-        if gid in self.loading_tasks:
-            try:
-                del self.loading_tasks[gid]
-            except KeyError:
-                pass
 
     @commands.command(
         help="Search YouTube and choose a song to play.\nUsage: !search <query>\nShows top 5 results and lets you choose.\nExample: !search never gonna give you up"
@@ -640,9 +415,11 @@ class MusicCommands(commands.Cog):
                 return
         elif not await self._ensure_voice(ctx):
             return
+
         gid = str(ctx.guild.id)
         loop = self.bot.loop
         await ctx.send(f"🔍 Searching YouTube for '{query}'...")
+
         try:
             ydl_opts_search = YDL_OPTIONS.copy()
             ydl_opts_search["noplaylist"] = True
@@ -659,7 +436,7 @@ class MusicCommands(commands.Cog):
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
-            await ctx.send(f"⏰ Search timed out for '{query}'.")
+            await ctx.send(f"❌ Search timed out for '{query}'.")
             return
         except Exception as e:
             await ctx.send(f"❌ Error processing search: {e}")
@@ -668,79 +445,117 @@ class MusicCommands(commands.Cog):
 
         entries = info.get("entries", [])
         if not entries:
-            await ctx.send("❌ No results found.")
+            await ctx.send("? No results found.")
             return
-        msg = "🎵 **Search results:**\n"
+
+        entries = entries[:5]
+        lines = []
         for i, entry in enumerate(entries, start=1):
             duration = entry.get("duration")
             duration_str = f" ({self._format_duration(duration)})" if duration else ""
-            msg += f"{i}. {entry.get('title', 'Unknown Title')}{duration_str}\n"
-        msg += "\n**Type the number of the video you want to play (1-5).**"
-        await ctx.send(msg)
+            lines.append(f"{i}. {entry.get('title', 'Unknown Title')}{duration_str}")
 
-        def check(m):
+        embed = discord.Embed(
+            title="Search Results",
+            description="\n".join(lines),
+            color=0x5865F2,
+        )
+        embed.set_footer(text="React with 1-5 to choose. Expires in 30s.")
+        msg = await ctx.send(embed=embed)
+
+        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        available_emojis = number_emojis[: len(entries)]
+        for emoji in available_emojis:
+            try:
+                await msg.add_reaction(emoji)
+            except discord.Forbidden:
+                await ctx.send("❌ I need permission to add reactions in this channel.")
+                return
+            except discord.HTTPException:
+                pass
+
+        def reaction_check(reaction, user):
             return (
-                m.author == ctx.author
-                and m.channel == ctx.channel
-                and m.content.isdigit()
-                and int(m.content) in range(1, len(entries) + 1)
+                user == ctx.author
+                and reaction.message.id == msg.id
+                and str(reaction.emoji) in available_emojis
             )
 
         try:
-            reply = await self.bot.wait_for("message", check=check, timeout=30.0)
+            reaction, user = await self.bot.wait_for(
+                "reaction_add", timeout=30.0, check=reaction_check
+            )
         except asyncio.TimeoutError:
-            await ctx.send("⏰ Selection timed out.")
+            embed.set_footer(text="Selection timed out.")
+            try:
+                await msg.edit(embed=embed)
+            except discord.HTTPException:
+                pass
             return
-        selection = int(reply.content)
-        selected_entry = entries[selection - 1]
+
+        selection = available_emojis.index(str(reaction.emoji))
+        selected_entry = entries[selection]
+
+        selected_url = selected_entry.get("webpage_url") or selected_entry.get("url")
+        if selected_url and not selected_url.startswith("http"):
+            selected_url = f"https://www.youtube.com/watch?v={selected_url}"
+        try:
+            fetched = await self._fetch_track_info(selected_url)
+        except Exception as e:
+            await ctx.send(f"❌ Error fetching track details: {e}")
+            self.logger.error(
+                f"Error fetching selected search track {selected_url}: {e}"
+            )
+            return
 
         track_info = {
-            "url": selected_entry.get("url"),
-            "title": selected_entry.get("title", "Unknown Title"),
-            "webpage_url": selected_entry.get("webpage_url"),
-            "duration": selected_entry.get("duration"),
+            "url": fetched.get("url"),
+            "title": fetched.get("title", selected_entry.get("title", "Unknown Title")),
+            "webpage_url": fetched.get("webpage_url") or selected_url,
+            "duration": fetched.get("duration", selected_entry.get("duration")),
         }
+        if not track_info["url"]:
+            await ctx.send("❌ Couldn't find a playable source for that selection.")
+            return
 
-        if not track_info.get("url"):
-            self.logger.info(
-                f"Direct URL not found for '{track_info['title']}' in search results, fetching full info..."
-            )
-            try:
-                track_info = await self._fetch_track_info(track_info["webpage_url"])
-                if not track_info:
-                    await ctx.send(f"❌ Error fetching details for the selected video.")
-                    return
-            except Exception as e:
-                await ctx.send(f"❌ Error fetching track details: {e}")
-                return
-
-        volume = self.volumes.get(gid, 1.0)
         queue = self.get_guild_queue(gid)
+        embed.description = "\n".join(
+            [
+                f"**{lines[selection]}** ← selected" if i == selection else line
+                for i, line in enumerate(lines)
+            ]
+        )
+        embed.set_footer(
+            text=(
+                f"Selected {selection + 1}: {track_info.get('title', 'Unknown Title')} "
+                f"({self._format_duration(track_info.get('duration'))})"
+            )
+        )
+        try:
+            await msg.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+
+        try:
+            await msg.remove_reaction(reaction.emoji, user)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
         if ctx.voice_client.is_playing():
             queue.append(track_info)
             await ctx.send(f"➕ Added to queue: **{track_info['title']}**")
         else:
             try:
-                source = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(track_info["url"], **FFMPEG_OPTIONS),
-                    volume=volume,
-                )
-
-                def _after_search_play(error_arg):
-                    self.handle_after_play(error_arg, ctx, gid)
-
-                ctx.voice_client.play(source, after=_after_search_play)
-                loop = self.bot.loop
-                self.playback_start_time[gid] = loop.time()
-                self.playback_seek_position[gid] = 0.0
-                self.pause_start_time.pop(gid, None)
-                self.current_tracks[gid] = track_info
-                await ctx.send(f"▶️ Now playing: **{track_info['title']}**")
+                await self._start_track(ctx, gid, track_info, announce=False)
+                await ctx.send(f"🎶 Now playing: **{track_info['title']}**")
             except Exception as e:
                 await ctx.send(f"❌ Error starting playback for selected track: {e}")
                 self.logger.error(
                     f"Error playing selected search track {track_info.get('title', 'N/A')}: {e}"
                 )
+
+
+
 
     @commands.command(
         help="Display the current queue.\nUsage: !queue\nShows up to 10 upcoming tracks."
