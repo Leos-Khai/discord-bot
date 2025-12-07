@@ -1,103 +1,48 @@
 # Discord Bot User Guide
 
 ## Overview
-This bot is built using `discord.py` and provides various functionalities, including music playback, administrative tools, and general commands. It is designed to enhance your Discord server experience.
-
----
+A `discord.py` bot with music playback, per-guild notifications (YouTube + Twitch), channel-linking tools, and lightweight admin/general commands. Python 3.12, MongoDB for persistence, and optional YouTube/Twitch API keys for notifications.
 
 ## Features
+- **Music**: `!join`, `!play <url|query>`, `!search <query>`, `!queue`, `!skip`, `!remove <pos>`, `!volume <0-150>`, `!pause`, `!resume`, `!stop`, `!seek`.
+- **Notifications**: `!notifications channel #text`, `!notifications youtube add <channel|url|@handle> [#target]`, `!notifications twitch add <user|url> [#target]`, list/remove variants. YouTube posts new uploads; Twitch posts a “Watch Stream” link and edits to “Watch VOD” when offline.
+- **Admin / Linking**: `!link_channel #text "Voice Name" @role`, `!list_links`, `!update_channel`, `!remove_channel`, `!set_message <type> <message>`.
+- **General**: `!ping`, `!calculate <a> <op> <b>`.
 
-### 1. Music Commands
-- **Join Voice Channel**: `!join`
-- **Play Music**: `!play <URL>`
-- **Search and Play**: `!search <query>`
-- **Queue Management**: `!queue`, `!skip`, `!remove <position>`
-- **Volume Control**: `!volume <0-150>`
-- **Pause/Resume/Stop**: `!pause`, `!resume`, `!stop`
-
-### 2. Administrative Commands
-- **Link Channels**: `!link_channel #text-channel "Voice Channel Name" @role`
-- **List Links**: `!list_links`
-- **Update Links**: `!update_channel "Voice Channel Name" #new-text-channel`
-- **Remove Links**: `!remove_channel`
-- **Set Custom Messages**: `!set_message <type> <message>`
-
-### 3. General Commands
-- **Ping**: `!ping`
-- **Calculator**: `!calculate <num1> <operator> <num2>`
-
----
-
-## Setup Instructions
-
-### Prerequisites
-- Python 3.12
-- `discord.py` library
-- Other dependencies listed in `requirements.txt`
-
-### Running Locally
-1. Clone the repository:
+## Setup
+1. Install Python 3.12 and MongoDB (or point to an existing Mongo instance).
+2. Create and activate a virtualenv, then install deps:
    ```bash
-   git clone <repository-url>
-   ```
-2. Navigate to the project directory:
-   ```bash
-   cd discord-bot
-   ```
-3. Install dependencies:
-   ```bash
+   python -m venv .venv
+   .\.venv\Scripts\activate
    pip install -r requirements.txt
    ```
-4. Add your bot token to `src/config.json`.
-5. Run the bot:
+3. Copy `.env.example` to `.env` and fill in:
+   - `DISCORD_TOKEN` (required)
+   - `BOT_PREFIX` (e.g., `!`)
+   - `MONGODB_URI`, `MONGODB_DATABASE`
+   - Optional notifications: `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
+4. Run the bot:
    ```bash
    python src/main.py
    ```
 
-### Running with Docker
-1. Build the Docker image:
-   ```bash
-   docker build -t discord-bot .
-   ```
-2. Run the Docker container:
-   ```bash
-   docker run -d --name discord-bot-container discord-bot
-   ```
-3. Check logs:
-   ```bash
-   docker logs discord-bot-container
-   ```
-
----
-
-## Customization
-
-### Setting Custom Messages
-Use the `!set_message` command to customize join, leave, or move messages. Example:
+## Docker
 ```bash
-!set_message join "$USER joined $CHANNEL"
+docker build -t discord-bot .
+docker run -d --name discord-bot -v %cd%\\src:/app/src discord-bot
 ```
 
-### Linking Channels
-Link text and voice channels with optional roles using `!link_channel`. Example:
-```bash
-!link_channel #general "Gaming Voice" @Gamers
-```
-
----
+## Notifications Quickstart
+1) Set a default channel: `!notifications channel #alerts`  
+2) Add YouTube: `!notifications youtube add https://youtube.com/@handle` (or channel ID/URL)  
+3) Add Twitch: `!notifications twitch add https://twitch.tv/username`  
+YouTube will only alert uploads after you add the channel. Twitch edits the live post to a VOD link when the stream ends.
 
 ## Troubleshooting
-
-### Common Issues
-- **Bot not responding**: Ensure the bot token is correct and the bot has necessary permissions.
-- **Music playback issues**: Check if `ffmpeg` is installed and accessible.
-
----
-
-## Contributing
-Feel free to contribute by submitting issues or pull requests.
-
----
+- Bot silent: check `DISCORD_TOKEN`, intents/permissions, and Mongo connection.
+- Music issues: ensure `ffmpeg` is installed and on PATH.
+- Notifications: confirm YouTube/Twitch API keys; see `src/discord_bot.log` for errors.
 
 ## License
-This project is licensed under the MIT License.
+MIT

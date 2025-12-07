@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- Notifications hardening:
+  - Twitch live posts use an embed link instead of a button and edit to “Watch VOD” when the stream ends, reusing the original message.
+  - YouTube polling now uses UTC-aware timestamps and starts from the subscription’s created time to avoid flooding old uploads.
+- Documentation: refreshed README with setup, env vars, features, and notification quickstart.
 - Notifications overhaul:
   - YouTube: `!notifications youtube add` accepts channel URLs/@handles/IDs, stores channel titles, and lists entries with human-readable names and target channels. Duplicate-video suppression via `notified_videos` kept.
   - Twitch: `!notifications twitch add` accepts profile URLs/usernames, stores display names, and lists entries with display + username and target channels. Uses client-credentials auth only.
