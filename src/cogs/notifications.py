@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Sequence
 
 import aiohttp
@@ -78,13 +78,19 @@ class Notifications(commands.Cog):
                 guild_id = sub["guild_id"]
                 youtube_channel_id = sub["youtube_channel_id"]
                 notification_channel_id = sub["notification_channel_id"]
-                last_checked = sub.get("last_checked")
-                if not isinstance(last_checked, datetime):
-                    last_checked = datetime.utcnow() - timedelta(hours=1)
+                last_checked = (
+                    sub.get("last_checked")
+                    or sub.get("created_at")
+                    or datetime.now(timezone.utc)
+                )
+                if isinstance(last_checked, datetime) and last_checked.tzinfo is None:
+                    last_checked = last_checked.replace(tzinfo=timezone.utc)
 
                 videos = await self._get_youtube_videos(youtube_channel_id, last_checked)
                 if not videos:
-                    await update_youtube_last_checked(guild_id, youtube_channel_id)
+                    await update_youtube_last_checked(
+                        guild_id, youtube_channel_id, datetime.now(timezone.utc)
+                    )
                     continue
 
                 notification_channel = self.bot.get_channel(int(notification_channel_id))
@@ -96,7 +102,9 @@ class Notifications(commands.Cog):
                     await self._send_youtube_notification(notification_channel, video)
                     await mark_video_notified(video["id"])
 
-                await update_youtube_last_checked(guild_id, youtube_channel_id)
+                await update_youtube_last_checked(
+                    guild_id, youtube_channel_id, datetime.now(timezone.utc)
+                )
         except Exception as e:
             self.logger.error(f"Error checking YouTube: {e}")
 

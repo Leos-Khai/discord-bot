@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -282,7 +282,7 @@ class DatabaseService:
         notification_channel_id: str,
         channel_title: Optional[str] = None,
     ) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         try:
             await self.youtube_subscriptions.insert_one(
                 {
@@ -319,7 +319,7 @@ class DatabaseService:
     ) -> None:
         await self.youtube_subscriptions.update_one(
             {"guild_id": guild_id, "youtube_channel_id": youtube_channel_id},
-            {"$set": {"last_checked": checked_at or datetime.utcnow()}},
+            {"$set": {"last_checked": checked_at or datetime.now(timezone.utc)}},
         )
 
     async def mark_video_notified(self, video_id: str) -> None:
