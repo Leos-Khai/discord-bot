@@ -78,13 +78,40 @@ class Notifications(commands.Cog):
                 guild_id = sub["guild_id"]
                 youtube_channel_id = sub["youtube_channel_id"]
                 notification_channel_id = sub["notification_channel_id"]
-                last_checked = (
+                raw_last_checked = (
                     sub.get("last_checked")
                     or sub.get("created_at")
                     or datetime.now(timezone.utc)
                 )
-                if isinstance(last_checked, datetime) and last_checked.tzinfo is None:
-                    last_checked = last_checked.replace(tzinfo=timezone.utc)
+                last_checked = datetime.now(timezone.utc)
+                needs_normalize = False
+
+                if isinstance(raw_last_checked, datetime):
+                    last_checked = raw_last_checked
+                    if raw_last_checked.tzinfo is None:
+                        last_checked = raw_last_checked.replace(tzinfo=timezone.utc)
+                        needs_normalize = True
+                elif isinstance(raw_last_checked, str):
+                    try:
+                        parsed = datetime.fromisoformat(raw_last_checked)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        last_checked = parsed
+                        needs_normalize = True
+                    except ValueError:
+                        needs_normalize = True
+                else:
+                    needs_normalize = True
+
+                if needs_normalize:
+                    try:
+                        await update_youtube_last_checked(
+                            guild_id, youtube_channel_id, last_checked
+                        )
+                    except Exception as norm_err:
+                        self.logger.warning(
+                            f"Failed to normalize last_checked for {youtube_channel_id}: {norm_err}"
+                        )
 
                 videos = await self._get_youtube_videos(youtube_channel_id, last_checked)
                 if not videos:
@@ -191,6 +218,16 @@ class Notifications(commands.Cog):
         """Fetch recent videos from a YouTube channel."""
         if not self.youtube_api_key:
             return []
+
+        if isinstance(since, str):
+            try:
+                since = datetime.fromisoformat(since)
+            except ValueError:
+                since = datetime.now(timezone.utc)
+        if not isinstance(since, datetime):
+            since = datetime.now(timezone.utc)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
 
         async with aiohttp.ClientSession() as session:
             url = "https://www.googleapis.com/youtube/v3/channels"
