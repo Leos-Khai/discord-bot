@@ -449,7 +449,7 @@ class MusicCommands(commands.Cog):
                 return False
         return True
 
-    @commands.command(
+    @commands.hybrid_command(
         help="Have the bot join your current voice channel without starting playback.\nUsage: !join"
     )
     async def join(self, ctx):
@@ -463,7 +463,7 @@ class MusicCommands(commands.Cog):
         ):
             await ctx.send(f"Already in **{ctx.voice_client.channel.name}**.")
 
-    @commands.command(
+    @commands.hybrid_command(
         help=(
             "Play a YouTube URL, playlist, or search query.\n"
             "Usage: !play <url|search terms>\n"
@@ -477,6 +477,10 @@ class MusicCommands(commands.Cog):
 
         if not await self._ensure_voice(ctx):
             return
+
+        # Slash commands timeout quickly; defer to buy time for yt-dlp fetches.
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer()
 
         gid = str(ctx.guild.id)
         queue = self.get_guild_queue(gid)
@@ -596,7 +600,7 @@ class MusicCommands(commands.Cog):
                     f"Error starting playback for {track.get('title', 'N/A')} in GID {gid}: {e}"
                 )
 
-    @commands.command(
+    @commands.hybrid_command(
         help="Search YouTube and choose a song to play.\nUsage: !search <query>\nShows top 5 results and lets you choose.\nExample: !search never gonna give you up"
     )
     async def search(self, ctx, *, query: str):
@@ -609,6 +613,9 @@ class MusicCommands(commands.Cog):
                 return
         elif not await self._ensure_voice(ctx):
             return
+
+        if ctx.interaction and not ctx.interaction.response.is_done():
+            await ctx.defer()
 
         gid = str(ctx.guild.id)
         loop = self.bot.loop
@@ -751,7 +758,8 @@ class MusicCommands(commands.Cog):
 
 
 
-    @commands.command(
+    @commands.hybrid_command(
+        name="queue",
         help="Display the current queue.\nUsage: !queue\nShows up to 10 upcoming tracks."
     )
     async def queue_list(self, ctx):
@@ -792,7 +800,7 @@ class MusicCommands(commands.Cog):
 
         await ctx.send(msg)
 
-    @commands.command(help="Show the currently playing track.\nUsage: !np")
+    @commands.hybrid_command(help="Show the currently playing track.\nUsage: !np")
     async def np(self, ctx):
         gid = str(ctx.guild.id)
         current = self.current_tracks.get(gid)
@@ -807,7 +815,7 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("❌ No track is currently playing.")
 
-    @commands.command(help="Skip the current track.\nUsage: !skip")
+    @commands.hybrid_command(help="Skip the current track.\nUsage: !skip")
     async def skip(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.stop()
@@ -817,7 +825,7 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("❌ I'm not connected to a voice channel.")
 
-    @commands.command(
+    @commands.hybrid_command(
         help="Remove tracks from the queue.\nUsage: !remove <position>\nOptions:\n- Number (1-10): Remove track at position\n- 'first': Remove first track\n- 'last': Remove last track\n- 'all': Clear queue & loading queue\n- Text: Remove first matching track\nExample: !remove 3"
     )
     async def remove(self, ctx, arg: str):
@@ -905,7 +913,7 @@ class MusicCommands(commands.Cog):
 
         await ctx.send(f"🗑️ Removed track: **{removed_title}**")
 
-    @commands.command(
+    @commands.hybrid_command(
         help="Set the music volume.\nUsage: !volume <0-150>\nExample: !volume 50\nVolume setting persists between sessions."
     )
     async def volume(self, ctx, vol: int = None):
@@ -937,7 +945,7 @@ class MusicCommands(commands.Cog):
             ctx.voice_client.source.volume = target_volume
         await ctx.send(f"🔊 Volume set to **{vol}%** for this server.")
 
-    @commands.command(help="Stop playback and disconnect the bot.\nUsage: !stop")
+    @commands.hybrid_command(help="Stop playback and disconnect the bot.\nUsage: !stop")
     async def stop(self, ctx):
         gid = str(ctx.guild.id)
         if gid in self.loading_tasks:
@@ -981,7 +989,7 @@ class MusicCommands(commands.Cog):
                 "⏹️ I'm not connected to a voice channel, but queues have been cleared."
             )
 
-    @commands.command(help="Pause the current track.\nUsage: !pause")
+    @commands.hybrid_command(help="Pause the current track.\nUsage: !pause")
     async def pause(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.pause()
@@ -994,7 +1002,7 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("❌ No music is currently playing.")
 
-    @commands.command(help="Resume the paused track.\nUsage: !resume")
+    @commands.hybrid_command(help="Resume the paused track.\nUsage: !resume")
     async def resume(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_paused():
             ctx.voice_client.resume()

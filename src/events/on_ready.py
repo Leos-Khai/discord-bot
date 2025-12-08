@@ -1,10 +1,13 @@
 from discord.ext import commands
 from db import get_servers, add_server
+from logger import get_logger
 
 
 class OnReady(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.logger = get_logger()
+        self.synced = False
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -25,6 +28,14 @@ class OnReady(commands.Cog):
         print("Loaded commands:")
         for command in self.bot.commands:
             print(f"- {command.name}")
+
+        if not self.synced:
+            try:
+                synced = await self.bot.tree.sync()
+                self.logger.info(f"Synced {len(synced)} slash commands.")
+                self.synced = True
+            except Exception as e:
+                self.logger.error(f"Failed to sync slash commands: {e}")
 
 
 async def setup(bot):
