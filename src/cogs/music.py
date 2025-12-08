@@ -352,13 +352,13 @@ class MusicCommands(commands.Cog):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    # Refresh the URL to prevent expiration issues
-                    if "webpage_url" in next_track:
-                        fresh_track = await self._fetch_track_info(
-                            next_track["webpage_url"]
-                        )
-                        if fresh_track and "url" in fresh_track:
-                            next_track["url"] = fresh_track["url"]
+                    # Use existing stream URL first; refresh only if missing or a previous attempt failed.
+                    if attempt > 0 or not next_track.get("url"):
+                        fresh_target = next_track.get("webpage_url") or next_track.get("url")
+                        if fresh_target:
+                            fresh_track = await self._fetch_track_info(fresh_target)
+                            if fresh_track and "url" in fresh_track:
+                                next_track["url"] = fresh_track["url"]
                     await self._start_track(ctx, gid, next_track, announce=True)
                     break  # Success, exit retry loop
 
