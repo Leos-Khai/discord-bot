@@ -192,6 +192,8 @@ class MusicCommands(commands.Cog):
                 ydl_opts = YDL_OPTIONS.copy()
                 ydl_opts["format"] = format_option
                 ydl_opts["noplaylist"] = True
+                # Force full extraction so we can resolve stream URLs from searches/playlists
+                ydl_opts["extract_flat"] = False
 
                 # Add timeout to prevent hanging
                 ydl_opts["socket_timeout"] = 30
@@ -213,10 +215,26 @@ class MusicCommands(commands.Cog):
                     self.logger.warning(f"Timeout fetching track info for {url_or_id}")
                     continue
 
-                if data and "url" in data:
-                    # Validate the URL is accessible
-                    if data["url"] and not data["url"].startswith("file://"):
-                        return data
+                if not data:
+                    continue
+
+                # If we got a search/playlist result, dig into the first entry and resolve it
+                if data.get("entries"):
+                    first_entry = next((entry for entry in data["entries"] if entry), None)
+                    if not first_entry:
+                        continue
+                    entry_target = (
+                        first_entry.get("webpage_url")
+                        or first_entry.get("url")
+                        or first_entry.get("id")
+                    )
+                    if entry_target:
+                        return await self._fetch_track_info(entry_target)
+                    continue
+
+                stream_url = data.get("url")
+                if stream_url and not stream_url.startswith("file://"):
+                    return data
 
             except Exception as e:
                 self.logger.warning(
