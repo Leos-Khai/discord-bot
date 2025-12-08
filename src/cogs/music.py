@@ -244,6 +244,94 @@ class MusicCommands(commands.Cog):
 
         raise Exception("Could not extract audio information with any available format")
 
+    def _canonical_playlist_url(self, url: str) -> str:
+        """Normalize a YouTube playlist URL so yt-dlp reliably expands it."""
+        match = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
+        if match:
+            list_id = match.group(1)
+            return f"https://www.youtube.com/playlist?list={list_id}"
+        return url
+
+    async def _fetch_playlist_tracks(self, playlist_url: str, limit: int = 250):
+        """Fetch playlist entries (metadata only). Actual streams resolved lazily."""
+        loop = self.bot.loop
+        ydl_opts = YDL_OPTIONS.copy()
+        ydl_opts["noplaylist"] = False
+        ydl_opts["extract_flat"] = True  # enumerate entries quickly
+        ydl_opts["socket_timeout"] = 30
+
+        ydl = youtube_dl.YoutubeDL(ydl_opts)
+
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, functools.partial(ydl.extract_info, playlist_url, download=False)
+                ),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Timeout fetching playlist info for {playlist_url}")
+            return []
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch playlist {playlist_url}: {e}")
+            return []
+
+        entries = [entry for entry in info.get("entries", []) if entry]
+        if not entries:
+            return []
+
+        playlist_entries = []
+        for entry in entries[:limit]:
+            entry_target = (
+                entry.get("webpage_url") or entry.get("url") or entry.get("id")
+            )
+            if not entry_target:
+                continue
+            playlist_entries.append(
+                {
+                    "target": entry_target,
+                    "title": entry.get("title") or "Unknown Title",
+                    "duration": entry.get("duration"),
+                }
+            )
+
+        return playlist_entries
+
+    async def _background_load_playlist(self, ctx, gid: str):
+        """Resolve playlist entries into playable tracks without blocking the main command."""
+        loading_queue = self.loading_queues.get(gid, [])
+        play_next_event = self.play_next_events.get(gid)
+
+        while loading_queue:
+            entry = loading_queue.pop(0)
+            entry_target = entry.get("target")
+            if not entry_target:
+                continue
+            try:
+                full = await self._fetch_track_info(entry_target)
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to resolve playlist entry {entry_target}: {e}"
+                )
+                continue
+
+            if not full or "url" not in full:
+                continue
+
+            track = {
+                "title": full.get("title") or entry.get("title") or "Unknown Title",
+                "url": full.get("url"),
+                "duration": full.get("duration") or entry.get("duration"),
+                "webpage_url": full.get("webpage_url") or entry_target,
+            }
+            queue = self.get_guild_queue(gid)
+            queue.append(track)
+            if play_next_event:
+                play_next_event.set()
+
+        # cleanup task record
+        self.loading_tasks.pop(gid, None)
+
     async def play_next(self, ctx, gid):
         """Plays the next track in the queue or waits for the background loader."""
         queue = self.get_guild_queue(gid)
@@ -295,25 +383,31 @@ class MusicCommands(commands.Cog):
                 self.logger.info(
                     f"play_next for GID {gid}: Queue empty, waiting for background loader..."
                 )
-                try:
-                    await asyncio.wait_for(play_next_event.wait(), timeout=10.0)
-                    play_next_event.clear()
-                    self.logger.info(
-                        f"play_next for GID {gid}: Loader added track, retrying..."
-                    )
-                    self.bot.loop.create_task(self.play_next(ctx, gid))
-                except asyncio.TimeoutError:
-                    self.logger.info(
-                        f"play_next for GID {gid}: Timed out waiting for loader. Queue finished."
-                    )
-                    self.current_tracks[gid] = None
-                    if ctx and ctx.channel:
-                        await ctx.send("Queue finished.")
-                except Exception as e:
-                    self.logger.error(
-                        f"Error waiting for play_next_event for GID {gid}: {e}"
-                    )
-                    self.current_tracks[gid] = None
+                while True:
+                    try:
+                        await asyncio.wait_for(play_next_event.wait(), timeout=30.0)
+                        play_next_event.clear()
+                        self.logger.info(
+                            f"play_next for GID {gid}: Loader added track, retrying..."
+                        )
+                        self.bot.loop.create_task(self.play_next(ctx, gid))
+                        return
+                    except asyncio.TimeoutError:
+                        if loader_task.done():
+                            break
+                        # keep waiting while loader runs
+                        continue
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error waiting for play_next_event for GID {gid}: {e}"
+                        )
+                        self.current_tracks[gid] = None
+                        return
+                # Loader finished but nothing queued
+                self.logger.info(
+                    f"play_next for GID {gid}: Loader finished with no tracks. Playback finished."
+                )
+                self.current_tracks[gid] = None
             else:
                 self.logger.info(
                     f"play_next for GID {gid}: Queue empty and no active loader. Playback finished."
@@ -370,7 +464,11 @@ class MusicCommands(commands.Cog):
             await ctx.send(f"Already in **{ctx.voice_client.channel.name}**.")
 
     @commands.command(
-        help="Play a YouTube URL or search query.\nUsage: !play <url|search terms>\nAutomatically joins your voice channel."
+        help=(
+            "Play a YouTube URL, playlist, or search query.\n"
+            "Usage: !play <url|search terms>\n"
+            "Automatically joins your voice channel."
+        )
     )
     async def play(self, ctx, *, query: str):
         if not query:
@@ -385,19 +483,97 @@ class MusicCommands(commands.Cog):
 
         target = query.strip()
         is_url = re.match(r"https?://", target)
+        is_playlist_url = is_url and re.search(r"[?&]list=", target) is not None
+
+        # Playlist expansion (first track plays, rest resolved in background)
+        if is_playlist_url:
+            try:
+                playlist_url = self._canonical_playlist_url(target)
+                entries = await self._fetch_playlist_tracks(playlist_url)
+            except Exception as e:
+                entries = []
+                self.logger.error(
+                    f"Failed to expand playlist for '{target}' in GID {gid}: {e}"
+                )
+            if entries:
+                # Cancel any previous loader
+                existing = self.loading_tasks.get(gid)
+                if existing and not existing.done():
+                    existing.cancel()
+
+                # Resolve first playable entry; keep the rest for background loading
+                first_track = None
+                remaining_entries = list(entries)
+                while remaining_entries and not first_track:
+                    candidate = remaining_entries.pop(0)
+                    try:
+                        candidate_full = await self._fetch_track_info(candidate["target"])
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Error resolving playlist entry {candidate.get('target')}: {e}"
+                        )
+                        continue
+                    url = candidate_full.get("url")
+                    if not url:
+                        continue
+                    first_track = {
+                        "title": candidate_full.get("title")
+                        or candidate.get("title")
+                        or "Unknown Title",
+                        "url": url,
+                        "duration": candidate_full.get("duration")
+                        or candidate.get("duration"),
+                        "webpage_url": candidate_full.get("webpage_url")
+                        or candidate.get("target"),
+                    }
+
+                if not first_track:
+                    await ctx.send("Couldn't find a playable track in that playlist.")
+                    return
+
+                loading_queue = self.loading_queues.setdefault(gid, [])
+                loading_queue.clear()
+                loading_queue.extend(remaining_entries)
+
+                if ctx.voice_client and ctx.voice_client.is_playing():
+                    queue.append(first_track)
+                    await ctx.send(
+                        f"Queued first playlist track: **{first_track['title']}**\n"
+                        f"Loading {len(loading_queue)} more in the background..."
+                    )
+                else:
+                    try:
+                        await self._start_track(ctx, gid, first_track, announce=False)
+                        await ctx.send(
+                            f"Now playing: **{first_track['title']}**\n"
+                            f"Loading {len(loading_queue)} more from playlist..."
+                        )
+                    except Exception as e:
+                        await ctx.send(f"Unable to start first playlist track: {e}")
+                        self.logger.error(
+                            f"Error starting playlist track for GID {gid}: {e}"
+                        )
+                        return
+
+                if loading_queue:
+                    task = self.bot.loop.create_task(self._background_load_playlist(ctx, gid))
+                    self.loading_tasks[gid] = task
+                return
+            # If playlist expansion failed, fall through to single track handling
+
         ydl_target = target if is_url else f"ytsearch1:{target}"
 
         try:
             track_info = await self._fetch_track_info(ydl_target)
         except Exception as e:
-            await ctx.send(f"❌ Unable to fetch track: {e}")
+            await ctx.send(f"Unable to fetch track: {e}")
             self.logger.error(
                 f"Failed to fetch track for '{query}' in GID {gid}: {e}"
             )
             return
 
         if not track_info or "url" not in track_info:
-            await ctx.send("❌ Couldn't find a playable audio source for that request.")
+            await ctx.send("Couldn't find a playable audio source for that request.")
             return
 
         track = {
@@ -409,13 +585,13 @@ class MusicCommands(commands.Cog):
 
         if ctx.voice_client and ctx.voice_client.is_playing():
             queue.append(track)
-            await ctx.send(f"➕ Added to queue: **{track['title']}**")
+            await ctx.send(f"Added to queue: **{track['title']}**")
         else:
             try:
                 await self._start_track(ctx, gid, track, announce=False)
-                await ctx.send(f"▶️ Now playing: **{track['title']}**")
+                await ctx.send(f"Now playing: **{track['title']}**")
             except Exception as e:
-                await ctx.send(f"❌ Error starting playback: {e}")
+                await ctx.send(f"Error starting playback: {e}")
                 self.logger.error(
                     f"Error starting playback for {track.get('title', 'N/A')} in GID {gid}: {e}"
                 )
@@ -844,3 +1020,4 @@ class MusicCommands(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(MusicCommands(bot))
+
