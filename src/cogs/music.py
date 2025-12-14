@@ -815,6 +815,51 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send("❌ No track is currently playing.")
 
+    @commands.hybrid_command(
+        help="Show source details for the current track.\nUsage: !source"
+    )
+    async def source(self, ctx):
+        gid = str(ctx.guild.id)
+        current = self.current_tracks.get(gid)
+
+        if not current:
+            await ctx.send("❌ No track is currently playing.")
+            return
+
+        source_url = (
+            current.get("webpage_url")
+            or current.get("original_url")
+            or current.get("url")
+        )
+        duration = current.get("duration")
+        position = self._get_current_position(gid)
+
+        embed = discord.Embed(
+            title=current.get("title", "Unknown track"),
+            description="Source info for the current track.",
+            url=source_url if source_url else discord.Embed.Empty,
+            color=discord.Color.blurple(),
+        )
+
+        if current.get("uploader"):
+            embed.add_field(name="Channel", value=current["uploader"], inline=True)
+        if duration is not None:
+            embed.add_field(
+                name="Duration", value=self._format_duration(duration), inline=True
+            )
+        if position:
+            embed.add_field(
+                name="Position", value=self._format_duration(position), inline=True
+            )
+        if source_url:
+            embed.add_field(
+                name="Source", value=f"[Open on YouTube]({source_url})", inline=False
+            )
+        if current.get("thumbnail"):
+            embed.set_thumbnail(url=current["thumbnail"])
+
+        await ctx.send(embed=embed)
+
     @commands.hybrid_command(help="Skip the current track.\nUsage: !skip")
     async def skip(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_playing():
