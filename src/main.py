@@ -13,22 +13,20 @@ load_dotenv()
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+
 # Load config from environment variables with fallback to config.json
 def load_config():
     # Try to load from environment variables first
-    token = os.getenv('DISCORD_TOKEN')
-    prefix = os.getenv('BOT_PREFIX', '!')
-    mongodb_uri = os.getenv('MONGODB_URI')
-    mongodb_database = os.getenv('MONGODB_DATABASE')
-    
+    token = os.getenv("DISCORD_TOKEN")
+    prefix = os.getenv("BOT_PREFIX", "!")
+    mongodb_uri = os.getenv("MONGODB_URI")
+    mongodb_database = os.getenv("MONGODB_DATABASE")
+
     if token and mongodb_uri and mongodb_database:
         return {
             "token": token,
             "prefix": prefix,
-            "mongodb": {
-                "uri": mongodb_uri,
-                "database": mongodb_database
-            }
+            "mongodb": {"uri": mongodb_uri, "database": mongodb_database},
         }
     else:
         # Fallback to config.json if environment variables are not set
@@ -36,13 +34,16 @@ def load_config():
             with open(os.path.join(script_dir, "config.json")) as f:
                 return json.load(f)
         except FileNotFoundError:
-            raise ValueError("Neither environment variables nor config.json found. Please set up your configuration.")
+            raise ValueError(
+                "Neither environment variables nor config.json found. Please set up your configuration."
+            )
+
 
 config = load_config()
 
 
 # Create bot and disable default command logging
-class CustomBot(commands.Bot):
+class CustomBot(commands.AutoShardedBot):
     async def on_command(self, ctx):
         pass  # Override to disable default command logging
 
