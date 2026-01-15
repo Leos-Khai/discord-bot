@@ -23,7 +23,6 @@ from db import (
     remove_youtube_subscription,
     set_notification_channel,
     update_stream_status,
-    update_youtube_last_checked,
 )
 from logger import get_logger
 
@@ -88,61 +87,43 @@ class Notifications(commands.Cog):
                 youtube_channel_id = sub["youtube_channel_id"]
                 channel_title = sub.get("channel_title", youtube_channel_id)
                 notification_channel_id = sub["notification_channel_id"]
-                raw_last_checked = (
-                    sub.get("last_checked")
-                    or sub.get("created_at")
-                    or datetime.now(timezone.utc)
-                )
-                last_checked = datetime.now(timezone.utc)
-                needs_normalize = False
 
-                if isinstance(raw_last_checked, datetime):
-                    last_checked = raw_last_checked
-                    if raw_last_checked.tzinfo is None:
-                        last_checked = raw_last_checked.replace(tzinfo=timezone.utc)
-                        needs_normalize = True
-                elif isinstance(raw_last_checked, str):
+                # Use created_at as the reference point - only notify for videos
+                # published AFTER the subscription was added. The notified_videos
+                # collection prevents duplicate notifications.
+                raw_created_at = sub.get("created_at") or datetime.now(timezone.utc)
+                since = datetime.now(timezone.utc)
+
+                if isinstance(raw_created_at, datetime):
+                    since = raw_created_at
+                    if raw_created_at.tzinfo is None:
+                        since = raw_created_at.replace(tzinfo=timezone.utc)
+                elif isinstance(raw_created_at, str):
                     try:
-                        parsed = datetime.fromisoformat(raw_last_checked)
+                        parsed = datetime.fromisoformat(raw_created_at)
                         if parsed.tzinfo is None:
                             parsed = parsed.replace(tzinfo=timezone.utc)
-                        last_checked = parsed
-                        needs_normalize = True
+                        since = parsed
                     except ValueError:
                         self.logger.warning(
-                            f"[YouTube] Invalid last_checked format for {channel_title}: {raw_last_checked}"
+                            f"[YouTube] Invalid created_at format for {channel_title}: {raw_created_at}"
                         )
-                        needs_normalize = True
                 else:
                     self.logger.warning(
-                        f"[YouTube] Unexpected last_checked type for {channel_title}: {type(raw_last_checked)}"
+                        f"[YouTube] Unexpected created_at type for {channel_title}: {type(raw_created_at)}"
                     )
-                    needs_normalize = True
-
-                if needs_normalize:
-                    try:
-                        await update_youtube_last_checked(
-                            guild_id, youtube_channel_id, last_checked
-                        )
-                    except Exception as norm_err:
-                        self.logger.warning(
-                            f"[YouTube] Failed to normalize last_checked for {channel_title}: {norm_err}"
-                        )
 
                 self.logger.debug(
-                    f"[YouTube] Checking {channel_title} (ID: {youtube_channel_id}) for videos since {last_checked.isoformat()}"
+                    f"[YouTube] Checking {channel_title} (ID: {youtube_channel_id}) for videos since {since.isoformat()}"
                 )
 
-                videos = await self._get_youtube_videos(youtube_channel_id, last_checked)
+                videos = await self._get_youtube_videos(youtube_channel_id, since)
 
                 if not videos:
                     self.logger.debug(f"[YouTube] No new videos for {channel_title}")
-                    await update_youtube_last_checked(
-                        guild_id, youtube_channel_id, datetime.now(timezone.utc)
-                    )
                     continue
 
-                self.logger.info(f"[YouTube] Found {len(videos)} new video(s) for {channel_title}")
+                self.logger.info(f"[YouTube] Found {len(videos)} video(s) since subscription for {channel_title}")
 
                 notification_channel = self.bot.get_channel(int(notification_channel_id))
                 if not notification_channel:
@@ -151,6 +132,7 @@ class Notifications(commands.Cog):
                     )
                     continue
 
+                notified_count = 0
                 for video in videos:
                     video_id = video["id"]
                     video_title = video["title"]
@@ -164,6 +146,7 @@ class Notifications(commands.Cog):
                     try:
                         await self._send_youtube_notification(notification_channel, video)
                         await mark_video_notified(video_id)
+                        notified_count += 1
                         self.logger.info(
                             f"[YouTube] Sent notification for: {video_title} (ID: {video_id}) from {channel_title}"
                         )
@@ -172,9 +155,9 @@ class Notifications(commands.Cog):
                             f"[YouTube] Failed to send notification for {video_title}: {send_err}"
                         )
 
-                await update_youtube_last_checked(
-                    guild_id, youtube_channel_id, datetime.now(timezone.utc)
-                )
+                if notified_count > 0:
+                    self.logger.info(f"[YouTube] Sent {notified_count} new notification(s) for {channel_title}")
+
         except Exception as e:
             self.logger.error(f"[YouTube] Error in check loop: {e}", exc_info=True)
 
@@ -355,8 +338,7 @@ class Notifications(commands.Cog):
                 "key": self.youtube_api_key,
                 "playlistId": uploads_playlist,
                 "part": "snippet",
-                "maxResults": 10,
-                "order": "date",
+                "maxResults": 25,
             }
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
