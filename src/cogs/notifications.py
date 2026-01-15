@@ -59,8 +59,15 @@ class Notifications(commands.Cog):
 
         if self.youtube_api_key:
             self.check_youtube.start()
+            self.logger.info("[Notifications] YouTube tracking enabled (checking every 5 minutes)")
+        else:
+            self.logger.warning("[Notifications] YouTube tracking disabled - no API key configured")
+
         if self.twitch_client_id and self.twitch_client_secret:
             self.check_twitch.start()
+            self.logger.info("[Notifications] Twitch tracking enabled (checking every 2 minutes)")
+        else:
+            self.logger.warning("[Notifications] Twitch tracking disabled - no API credentials configured")
 
     def cog_unload(self):
         if self.check_youtube.is_running():
@@ -74,9 +81,12 @@ class Notifications(commands.Cog):
         """Poll YouTube subscriptions for new uploads."""
         try:
             subscriptions = await get_youtube_subscriptions()
+            self.logger.info(f"[YouTube] Checking {len(subscriptions)} subscription(s)")
+
             for sub in subscriptions:
                 guild_id = sub["guild_id"]
                 youtube_channel_id = sub["youtube_channel_id"]
+                channel_title = sub.get("channel_title", youtube_channel_id)
                 notification_channel_id = sub["notification_channel_id"]
                 raw_last_checked = (
                     sub.get("last_checked")
@@ -99,8 +109,14 @@ class Notifications(commands.Cog):
                         last_checked = parsed
                         needs_normalize = True
                     except ValueError:
+                        self.logger.warning(
+                            f"[YouTube] Invalid last_checked format for {channel_title}: {raw_last_checked}"
+                        )
                         needs_normalize = True
                 else:
+                    self.logger.warning(
+                        f"[YouTube] Unexpected last_checked type for {channel_title}: {type(raw_last_checked)}"
+                    )
                     needs_normalize = True
 
                 if needs_normalize:
@@ -110,30 +126,57 @@ class Notifications(commands.Cog):
                         )
                     except Exception as norm_err:
                         self.logger.warning(
-                            f"Failed to normalize last_checked for {youtube_channel_id}: {norm_err}"
+                            f"[YouTube] Failed to normalize last_checked for {channel_title}: {norm_err}"
                         )
 
+                self.logger.debug(
+                    f"[YouTube] Checking {channel_title} (ID: {youtube_channel_id}) for videos since {last_checked.isoformat()}"
+                )
+
                 videos = await self._get_youtube_videos(youtube_channel_id, last_checked)
+
                 if not videos:
+                    self.logger.debug(f"[YouTube] No new videos for {channel_title}")
                     await update_youtube_last_checked(
                         guild_id, youtube_channel_id, datetime.now(timezone.utc)
                     )
                     continue
 
+                self.logger.info(f"[YouTube] Found {len(videos)} new video(s) for {channel_title}")
+
                 notification_channel = self.bot.get_channel(int(notification_channel_id))
+                if not notification_channel:
+                    self.logger.error(
+                        f"[YouTube] Notification channel {notification_channel_id} not found for {channel_title} (guild: {guild_id})"
+                    )
+                    continue
+
                 for video in videos:
-                    if not notification_channel:
-                        break
-                    if await is_video_notified(video["id"]):
+                    video_id = video["id"]
+                    video_title = video["title"]
+
+                    if await is_video_notified(video_id):
+                        self.logger.debug(
+                            f"[YouTube] Skipping already notified video: {video_title} (ID: {video_id})"
+                        )
                         continue
-                    await self._send_youtube_notification(notification_channel, video)
-                    await mark_video_notified(video["id"])
+
+                    try:
+                        await self._send_youtube_notification(notification_channel, video)
+                        await mark_video_notified(video_id)
+                        self.logger.info(
+                            f"[YouTube] Sent notification for: {video_title} (ID: {video_id}) from {channel_title}"
+                        )
+                    except Exception as send_err:
+                        self.logger.error(
+                            f"[YouTube] Failed to send notification for {video_title}: {send_err}"
+                        )
 
                 await update_youtube_last_checked(
                     guild_id, youtube_channel_id, datetime.now(timezone.utc)
                 )
         except Exception as e:
-            self.logger.error(f"Error checking YouTube: {e}")
+            self.logger.error(f"[YouTube] Error in check loop: {e}", exc_info=True)
 
     @tasks.loop(minutes=2)
     async def check_twitch(self):
@@ -143,19 +186,30 @@ class Notifications(commands.Cog):
             if not subscriptions:
                 return
 
+            self.logger.info(f"[Twitch] Checking {len(subscriptions)} subscription(s)")
+
             streamers = list({sub["twitch_username"] for sub in subscriptions})
             for i in range(0, len(streamers), 100):
                 batch = streamers[i : i + 100]
                 streams = await self._get_twitch_streams(batch)
+
+                if streams is None:
+                    self.logger.error(f"[Twitch] Failed to fetch streams for batch: {batch}")
+                    continue
+
                 stream_lookup: Dict[str, dict] = {
-                    stream["user_login"]: stream for stream in streams
+                    stream["user_login"].lower(): stream for stream in streams
                 }
+
+                live_count = len(stream_lookup)
+                self.logger.debug(f"[Twitch] Batch {i // 100 + 1}: {live_count} live out of {len(batch)} streamers")
 
                 batch_subscriptions = [
                     sub for sub in subscriptions if sub["twitch_username"] in batch
                 ]
                 for sub in batch_subscriptions:
                     username = sub["twitch_username"]
+                    display_name = sub.get("display_name", username)
                     guild_id = sub["guild_id"]
                     notification_channel_id = sub["notification_channel_id"]
 
@@ -166,12 +220,28 @@ class Notifications(commands.Cog):
                         int(notification_channel_id)
                     )
 
+                    if not notification_channel:
+                        self.logger.error(
+                            f"[Twitch] Notification channel {notification_channel_id} not found for {display_name} (guild: {guild_id})"
+                        )
+
                     if current_stream and not was_live:
+                        # Streamer went live
+                        self.logger.info(
+                            f"[Twitch] {display_name} went LIVE - Game: {current_stream.get('game_name', 'Unknown')}, "
+                            f"Viewers: {current_stream.get('viewer_count', 0)}"
+                        )
                         message_id = None
                         if notification_channel:
-                            message_id = await self._send_twitch_notification(
-                                notification_channel, current_stream, "live"
-                            )
+                            try:
+                                message_id = await self._send_twitch_notification(
+                                    notification_channel, current_stream, "live"
+                                )
+                                self.logger.info(f"[Twitch] Sent live notification for {display_name}")
+                            except Exception as send_err:
+                                self.logger.error(
+                                    f"[Twitch] Failed to send live notification for {display_name}: {send_err}"
+                                )
                         await update_stream_status(
                             guild_id,
                             username,
@@ -183,6 +253,8 @@ class Notifications(commands.Cog):
                             display_name=current_stream.get("user_name"),
                         )
                     elif not current_stream and was_live:
+                        # Streamer went offline
+                        self.logger.info(f"[Twitch] {display_name} went OFFLINE")
                         offline_payload = {
                             "user_name": state.get("display_name")
                             or sub.get("display_name")
@@ -197,9 +269,15 @@ class Notifications(commands.Cog):
                         }
                         message_id = offline_payload["message_id"]
                         if notification_channel:
-                            message_id = await self._send_twitch_notification(
-                                notification_channel, offline_payload, "offline"
-                            )
+                            try:
+                                message_id = await self._send_twitch_notification(
+                                    notification_channel, offline_payload, "offline"
+                                )
+                                self.logger.info(f"[Twitch] Sent/edited offline notification for {display_name}")
+                            except Exception as send_err:
+                                self.logger.error(
+                                    f"[Twitch] Failed to send offline notification for {display_name}: {send_err}"
+                                )
                         await update_stream_status(
                             guild_id,
                             username,
@@ -211,18 +289,20 @@ class Notifications(commands.Cog):
                             display_name=offline_payload["display_name"],
                         )
         except Exception as e:
-            self.logger.error(f"Error checking Twitch: {e}")
+            self.logger.error(f"[Twitch] Error in check loop: {e}", exc_info=True)
 
     # --- External API helpers --------------------------------------------
     async def _get_youtube_videos(self, channel_id: str, since: datetime):
         """Fetch recent videos from a YouTube channel."""
         if not self.youtube_api_key:
+            self.logger.warning("[YouTube API] No API key configured")
             return []
 
         if isinstance(since, str):
             try:
                 since = datetime.fromisoformat(since)
             except ValueError:
+                self.logger.warning(f"[YouTube API] Invalid since datetime string: {since}")
                 since = datetime.now(timezone.utc)
         if not isinstance(since, datetime):
             since = datetime.now(timezone.utc)
@@ -230,6 +310,7 @@ class Notifications(commands.Cog):
             since = since.replace(tzinfo=timezone.utc)
 
         async with aiohttp.ClientSession() as session:
+            # Step 1: Get the uploads playlist ID
             url = "https://www.googleapis.com/youtube/v3/channels"
             params = {
                 "key": self.youtube_api_key,
@@ -238,14 +319,37 @@ class Notifications(commands.Cog):
             }
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
+                    response_text = await resp.text()
+                    self.logger.error(
+                        f"[YouTube API] Failed to get channel {channel_id}: "
+                        f"HTTP {resp.status} - {response_text[:500]}"
+                    )
                     return []
                 data = await resp.json()
-                if not data.get("items"):
+
+                # Check for API errors in response
+                if "error" in data:
+                    error_info = data["error"]
+                    self.logger.error(
+                        f"[YouTube API] API error for channel {channel_id}: "
+                        f"Code {error_info.get('code')} - {error_info.get('message')}"
+                    )
                     return []
+
+                if not data.get("items"):
+                    self.logger.warning(
+                        f"[YouTube API] No channel found for ID: {channel_id}"
+                    )
+                    return []
+
                 uploads_playlist = data["items"][0]["contentDetails"]["relatedPlaylists"][
                     "uploads"
                 ]
+                self.logger.debug(
+                    f"[YouTube API] Channel {channel_id} uploads playlist: {uploads_playlist}"
+                )
 
+            # Step 2: Get recent videos from uploads playlist
             url = "https://www.googleapis.com/youtube/v3/playlistItems"
             params = {
                 "key": self.youtube_api_key,
@@ -256,56 +360,119 @@ class Notifications(commands.Cog):
             }
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
+                    response_text = await resp.text()
+                    self.logger.error(
+                        f"[YouTube API] Failed to get playlist {uploads_playlist}: "
+                        f"HTTP {resp.status} - {response_text[:500]}"
+                    )
                     return []
                 data = await resp.json()
 
+                # Check for API errors in response
+                if "error" in data:
+                    error_info = data["error"]
+                    self.logger.error(
+                        f"[YouTube API] API error for playlist {uploads_playlist}: "
+                        f"Code {error_info.get('code')} - {error_info.get('message')}"
+                    )
+                    return []
+
+        items = data.get("items", [])
+        self.logger.debug(
+            f"[YouTube API] Retrieved {len(items)} items from playlist for channel {channel_id}"
+        )
+
         videos = []
-        for item in data.get("items", []):
-            published = datetime.fromisoformat(
-                item["snippet"]["publishedAt"].replace("Z", "+00:00")
-            )
-            if published > since:
-                videos.append(
-                    {
-                        "id": item["snippet"]["resourceId"]["videoId"],
-                        "title": item["snippet"]["title"],
-                        "url": f"https://www.youtube.com/watch?v={item['snippet']['resourceId']['videoId']}",
-                        "thumbnail": item["snippet"]["thumbnails"]["medium"]["url"],
-                        "channel_name": item["snippet"]["channelTitle"],
-                        "published_at": published,
-                    }
+        skipped_older = 0
+        for item in items:
+            try:
+                published = datetime.fromisoformat(
+                    item["snippet"]["publishedAt"].replace("Z", "+00:00")
                 )
+                video_id = item["snippet"]["resourceId"]["videoId"]
+                video_title = item["snippet"]["title"]
+
+                if published > since:
+                    videos.append(
+                        {
+                            "id": video_id,
+                            "title": video_title,
+                            "url": f"https://www.youtube.com/watch?v={video_id}",
+                            "thumbnail": item["snippet"]["thumbnails"].get("medium", {}).get("url", ""),
+                            "channel_name": item["snippet"]["channelTitle"],
+                            "published_at": published,
+                        }
+                    )
+                    self.logger.debug(
+                        f"[YouTube API] New video found: {video_title} (published: {published.isoformat()})"
+                    )
+                else:
+                    skipped_older += 1
+                    self.logger.debug(
+                        f"[YouTube API] Skipping older video: {video_title} "
+                        f"(published: {published.isoformat()}, since: {since.isoformat()})"
+                    )
+            except Exception as parse_err:
+                self.logger.error(
+                    f"[YouTube API] Error parsing video item: {parse_err} - Item: {item}"
+                )
+
+        self.logger.debug(
+            f"[YouTube API] Channel {channel_id}: {len(videos)} new, {skipped_older} older than {since.isoformat()}"
+        )
         return videos
 
     async def _get_twitch_streams(self, usernames: Sequence[str]):
         """Fetch live stream info for multiple Twitch usernames."""
         token = await self.get_twitch_token()
         if not token:
-            return []
+            self.logger.error("[Twitch API] No token available")
+            return None
 
         async with aiohttp.ClientSession() as session:
             headers = {
                 "Client-ID": self.twitch_client_id,
                 "Authorization": f"Bearer {token}",
             }
+
+            # Step 1: Get user IDs from usernames
             url = "https://api.twitch.tv/helix/users"
             params = {"login": usernames}
             async with session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 401:
+                    self.logger.warning("[Twitch API] Token expired, clearing cached token")
+                    self.twitch_token = None
+                    return None
                 if resp.status != 200:
-                    return []
+                    response_text = await resp.text()
+                    self.logger.error(
+                        f"[Twitch API] Failed to get users: HTTP {resp.status} - {response_text[:500]}"
+                    )
+                    return None
                 users_data = await resp.json()
                 user_ids = [user["id"] for user in users_data.get("data", [])]
+                self.logger.debug(
+                    f"[Twitch API] Resolved {len(user_ids)} user IDs from {len(usernames)} usernames"
+                )
 
             if not user_ids:
+                self.logger.warning(f"[Twitch API] No user IDs found for usernames: {usernames}")
                 return []
 
+            # Step 2: Get streams for those user IDs
             url = "https://api.twitch.tv/helix/streams"
             params = {"user_id": user_ids}
             async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status != 200:
-                    return []
+                    response_text = await resp.text()
+                    self.logger.error(
+                        f"[Twitch API] Failed to get streams: HTTP {resp.status} - {response_text[:500]}"
+                    )
+                    return None
                 streams_data = await resp.json()
-                return streams_data.get("data", [])
+                streams = streams_data.get("data", [])
+                self.logger.debug(f"[Twitch API] Found {len(streams)} live stream(s)")
+                return streams
 
     async def _get_twitch_vod_url(
         self, user_id: Optional[str], stream_id: Optional[str], user_login: Optional[str]
@@ -313,6 +480,7 @@ class Notifications(commands.Cog):
         """Return the VOD URL for the most recent stream, preferring a VOD that matches the stream_id."""
         token = await self.get_twitch_token()
         if not token:
+            self.logger.warning("[Twitch API] Cannot get VOD - no token available")
             return None
 
         # Resolve user_id if we only have the login.
@@ -327,13 +495,18 @@ class Notifications(commands.Cog):
                 params = {"login": user_login}
                 async with session.get(url, headers=headers, params=params) as resp:
                     if resp.status != 200:
+                        self.logger.warning(
+                            f"[Twitch API] Failed to resolve user_id for {user_login}: HTTP {resp.status}"
+                        )
                         return None
                     data = await resp.json()
                     if not data.get("data"):
+                        self.logger.warning(f"[Twitch API] No user data found for {user_login}")
                         return None
                     resolved_user_id = data["data"][0]["id"]
 
         if not resolved_user_id:
+            self.logger.warning("[Twitch API] Cannot get VOD - no user_id available")
             return None
 
         async with aiohttp.ClientSession() as session:
@@ -346,16 +519,25 @@ class Notifications(commands.Cog):
                 "https://api.twitch.tv/helix/videos", headers=headers, params=params
             ) as resp:
                 if resp.status != 200:
+                    self.logger.warning(
+                        f"[Twitch API] Failed to get VODs for user {resolved_user_id}: HTTP {resp.status}"
+                    )
                     return None
                 data = await resp.json()
 
         videos = data.get("data", [])
+        self.logger.debug(f"[Twitch API] Found {len(videos)} VOD(s) for user {resolved_user_id}")
+
         for video in videos:
             if stream_id and video.get("stream_id") == stream_id:
+                self.logger.debug(f"[Twitch API] Found matching VOD for stream {stream_id}: {video.get('url')}")
                 return video.get("url")
 
         if videos:
+            self.logger.debug(f"[Twitch API] Using most recent VOD: {videos[0].get('url')}")
             return videos[0].get("url")
+
+        self.logger.debug(f"[Twitch API] No VODs found for user {resolved_user_id}")
         return None
 
     async def get_twitch_token(self):
@@ -363,6 +545,7 @@ class Notifications(commands.Cog):
         if self.twitch_token:
             return self.twitch_token
 
+        self.logger.info("[Twitch API] Requesting new OAuth token")
         async with aiohttp.ClientSession() as session:
             data = {
                 "client_id": self.twitch_client_id,
@@ -373,8 +556,12 @@ class Notifications(commands.Cog):
                 if resp.status == 200:
                     result = await resp.json()
                     self.twitch_token = result["access_token"]
+                    self.logger.info("[Twitch API] Successfully obtained OAuth token")
                     return self.twitch_token
-                self.logger.error(f"Failed to get Twitch token: {resp.status}")
+                response_text = await resp.text()
+                self.logger.error(
+                    f"[Twitch API] Failed to get token: HTTP {resp.status} - {response_text[:500]}"
+                )
                 return None
 
     async def _send_youtube_notification(self, channel: discord.TextChannel, video: dict):

@@ -14,7 +14,7 @@ log_file = os.path.join(logs_dir, "discord_bot.log")
 
 # Configure root logger
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # Daily rotating file handler (rotates at midnight)
 file_handler = TimedRotatingFileHandler(
