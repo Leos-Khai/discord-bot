@@ -49,7 +49,7 @@ Music playback requires `ffmpeg` on PATH.
 
 Module-level wrapper functions maintain backward compatibility. `initialize_database()` creates indexes on startup.
 
-**Logging**: All diagnostics go through `get_logger()` from `src/logger.py`. Logs to `src/discord_bot.log`.
+**Logging**: All diagnostics go through `get_logger()` from `src/logger.py`. Logs to `logs/discord_bot.log` with daily rotation.
 
 ## Code Patterns
 
@@ -61,4 +61,4 @@ Module-level wrapper functions maintain backward compatibility. `initialize_data
 
 ## Testing
 
-No automated test suite. Test changes manually by running the bot in a test guild and exercising affected commands/events. Check `src/discord_bot.log` for errors.
+No automated test suite. Test changes manually by running the bot in a test guild and exercising affected commands/events. Check `logs/discord_bot.log` for errors.
