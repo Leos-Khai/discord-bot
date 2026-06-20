@@ -12,3 +12,10 @@ dependencies = [
     "pynacl>=1.6.2",
     "yt-dlp>=2026.1.29",
 ]
+
+[project.scripts]
+bot = "main:run"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"

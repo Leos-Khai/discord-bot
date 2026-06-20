@@ -255,7 +255,7 @@ wheels = [
 [[package]]
 name = "discord-bot"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "davey" },
     { name = "discord-py" },

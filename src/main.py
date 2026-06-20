@@ -121,5 +121,9 @@ async def main():
             logger.error(f"Failed to start bot: {e}")
 
 
-if __name__ == "__main__":
+def run():
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
