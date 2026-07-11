@@ -44,10 +44,10 @@ class FakeVoice:
         if self.after:
             self.after(None)
 
-    def finish(self):
+    def finish(self, error=None):
         self.playing = False
         if self.after:
-            self.after(None)
+            self.after(error)
 
     async def disconnect(self):
         self.disconnected = True
@@ -144,6 +144,17 @@ class GuildPlaybackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["first", "second"], [track.title for track in self.voice.played])
         self.assertEqual("started", self.outcomes.items[-1].kind)
+
+    async def test_publishes_a_failure_when_the_voice_player_reports_a_stream_error(self):
+        await self.playback.enqueue(TrackRequest("first"), "voice-1")
+
+        self.voice.finish(RuntimeError("stream unavailable"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertIsNone(self.playback.current_track)
+        self.assertEqual("failed", self.outcomes.items[-1].kind)
+        self.assertEqual("stream unavailable", self.outcomes.items[-1].detail)
 
     async def test_starts_a_playlist_then_loads_the_remaining_tracks(self):
         outcome = await self.playback.enqueue_playlist(TrackRequest("playlist"), "voice-1")

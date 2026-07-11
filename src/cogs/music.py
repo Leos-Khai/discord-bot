@@ -33,6 +33,13 @@ FFMPEG_OPTIONS = {
 }
 
 
+class ErrorForwardingPCMVolumeTransformer(discord.PCMVolumeTransformer):
+    @property
+    def _current_error(self):
+        # discord.py's AudioPlayer inspects only its outer source for this error.
+        return getattr(self.original, "_current_error", None)
+
+
 class YtdlpMediaAdapter:
     def __init__(self, logger):
         self.logger = logger
@@ -50,11 +57,14 @@ class YtdlpMediaAdapter:
         )
 
     async def resolve(self, request: TrackRequest) -> Track:
+        target = request.target
+        if not re.match(r"https?://", target, re.IGNORECASE) and not target.startswith("ytsearch"):
+            target = f"ytsearch1:{target}"
         data = None
         last_error = None
         for format_option in ("bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio", "best[height<=720]/best", "worst"):
             try:
-                data = await self._extract(request.target, flat=False, playlist=False, format_option=format_option)
+                data = await self._extract(target, flat=False, playlist=False, format_option=format_option)
                 if data:
                     break
             except Exception as error:
@@ -125,7 +135,7 @@ class DiscordVoiceAdapter:
         client = self.guild.voice_client
         if not client or not client.is_connected():
             raise RuntimeError("Voice client unavailable for playback")
-        source = discord.PCMVolumeTransformer(
+        source = ErrorForwardingPCMVolumeTransformer(
             discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS), volume=volume
         )
         client.play(source, after=after)
