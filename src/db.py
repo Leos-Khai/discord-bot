@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
+from twitch_transitions import (
+    DeliveryStatus,
+    TwitchDeliveryState,
+    TwitchSubscription,
+)
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -380,6 +385,10 @@ class DatabaseService:
         result = await self.twitch_subscriptions.delete_one(
             {"guild_id": guild_id, "twitch_username": twitch_username.lower()}
         )
+        if result.deleted_count:
+            await self.twitch_stream_status.delete_one(
+                {"guild_id": guild_id, "twitch_username": twitch_username.lower()}
+            )
         return result.deleted_count > 0
 
     async def get_twitch_subscriptions(self) -> List[Dict[str, Any]]:
@@ -391,6 +400,70 @@ class DatabaseService:
     ) -> List[Dict[str, Any]]:
         cursor = self.twitch_subscriptions.find({"guild_id": guild_id})
         return await cursor.to_list(None)
+
+    async def tracked_subscriptions(self) -> List[TwitchSubscription]:
+        subscriptions = await self.get_twitch_subscriptions()
+        return [
+            TwitchSubscription(
+                guild_id=subscription["guild_id"],
+                twitch_username=subscription["twitch_username"],
+                notification_channel_id=subscription["notification_channel_id"],
+                display_name=subscription.get("display_name"),
+            )
+            for subscription in subscriptions
+        ]
+
+    async def delivery_state(
+        self, guild_id: str, twitch_username: str
+    ) -> Optional[TwitchDeliveryState]:
+        doc = await self.twitch_stream_status.find_one(
+            {"guild_id": guild_id, "twitch_username": twitch_username.lower()},
+            {"_id": 0},
+        )
+        if not doc:
+            return None
+        try:
+            delivery_status = DeliveryStatus(
+                doc.get("delivery_status", DeliveryStatus.DELIVERED)
+            )
+        except ValueError:
+            delivery_status = DeliveryStatus.DELIVERED
+        return TwitchDeliveryState(
+            guild_id=doc["guild_id"],
+            twitch_username=doc["twitch_username"],
+            is_live=doc.get("is_live", False),
+            stream_id=doc.get("stream_id"),
+            message_id=doc.get("message_id"),
+            delivery_status=delivery_status,
+            delivery_attempts=doc.get("delivery_attempts", 0),
+            user_id=doc.get("user_id"),
+            user_login=doc.get("user_login"),
+            display_name=doc.get("display_name"),
+        )
+
+    async def save_delivery_state(self, state: TwitchDeliveryState) -> None:
+        now = datetime.utcnow()
+        await self.twitch_stream_status.update_one(
+            {
+                "guild_id": state.guild_id,
+                "twitch_username": state.twitch_username.lower(),
+            },
+            {
+                "$set": {
+                    "is_live": state.is_live,
+                    "stream_id": state.stream_id,
+                    "message_id": state.message_id,
+                    "delivery_status": state.delivery_status.value,
+                    "delivery_attempts": state.delivery_attempts,
+                    "user_id": state.user_id,
+                    "user_login": state.user_login.lower() if state.user_login else None,
+                    "display_name": state.display_name,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
 
     async def get_stream_status(
         self, guild_id: str, twitch_username: str
@@ -476,6 +549,10 @@ class DatabaseService:
 
 # Singleton-style service to keep current imports stable
 _db_service = DatabaseService()
+
+
+def get_database_service() -> DatabaseService:
+    return _db_service
 
 
 async def initialize_database():

@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Sequence
+from typing import Optional, Sequence
 
 import aiohttp
 import discord
@@ -11,9 +11,8 @@ from cogs.admin import is_admin
 from db import (
     add_twitch_subscription,
     add_youtube_subscription,
+    get_database_service,
     get_notification_channel,
-    get_stream_status,
-    get_twitch_subscriptions,
     get_twitch_subscriptions_by_guild,
     get_youtube_subscriptions,
     get_youtube_subscriptions_by_guild,
@@ -22,9 +21,80 @@ from db import (
     remove_twitch_subscription,
     remove_youtube_subscription,
     set_notification_channel,
-    update_stream_status,
 )
 from logger import get_logger
+from twitch_transitions import (
+    TwitchDeliveryState,
+    TwitchStream,
+    TwitchSubscription,
+    TwitchTransitions,
+)
+
+
+class TwitchApiAdapter:
+    def __init__(self, fetch_streams, fetch_vod_url):
+        self._fetch_streams = fetch_streams
+        self._fetch_vod_url = fetch_vod_url
+
+    async def live_streams(self, usernames: Sequence[str]):
+        streams = await self._fetch_streams(usernames)
+        if streams is None:
+            return None
+        return [
+            TwitchStream(
+                stream_id=stream["id"],
+                user_id=stream.get("user_id"),
+                user_login=stream["user_login"],
+                display_name=stream.get("user_name"),
+                payload=stream,
+            )
+            for stream in streams
+        ]
+
+    async def vod_url(
+        self,
+        user_id: Optional[str],
+        stream_id: Optional[str],
+        user_login: Optional[str],
+    ) -> Optional[str]:
+        return await self._fetch_vod_url(user_id, stream_id, user_login)
+
+
+class DiscordTwitchPublisher:
+    def __init__(self, bot, send_notification):
+        self._bot = bot
+        self._send_notification = send_notification
+
+    async def publish_live(
+        self, subscription: TwitchSubscription, stream: TwitchStream
+    ) -> str:
+        channel = self._notification_channel(subscription)
+        return await self._send_notification(channel, dict(stream.payload), "live")
+
+    async def publish_offline(
+        self,
+        subscription: TwitchSubscription,
+        state: TwitchDeliveryState,
+        vod_url: Optional[str],
+    ) -> str:
+        channel = self._notification_channel(subscription)
+        payload = {
+            "user_name": state.display_name or state.twitch_username,
+            "display_name": state.display_name or state.twitch_username,
+            "user_login": state.user_login or state.twitch_username,
+            "user_id": state.user_id,
+            "stream_id": state.stream_id,
+            "message_id": state.message_id,
+        }
+        return await self._send_notification(channel, payload, "offline", vod_url)
+
+    def _notification_channel(self, subscription: TwitchSubscription):
+        channel = self._bot.get_channel(int(subscription.notification_channel_id))
+        if not channel:
+            raise LookupError(
+                f"Notification channel {subscription.notification_channel_id} is unavailable"
+            )
+        return channel
 
 
 class Notifications(commands.Cog):
@@ -55,6 +125,12 @@ class Notifications(commands.Cog):
             "twitch_client_secret"
         )
         self.twitch_token: Optional[str] = None
+        self.twitch_transitions = TwitchTransitions(
+            TwitchApiAdapter(self._get_twitch_streams, self._get_twitch_vod_url),
+            get_database_service(),
+            DiscordTwitchPublisher(bot, self._send_twitch_notification),
+            logger=self.logger,
+        )
 
         if self.youtube_api_key:
             self.check_youtube.start()
@@ -165,112 +241,7 @@ class Notifications(commands.Cog):
     async def check_twitch(self):
         """Poll Twitch subscriptions for live/offline transitions."""
         try:
-            subscriptions = await get_twitch_subscriptions()
-            if not subscriptions:
-                return
-
-            self.logger.info(f"[Twitch] Checking {len(subscriptions)} subscription(s)")
-
-            streamers = list({sub["twitch_username"] for sub in subscriptions})
-            for i in range(0, len(streamers), 100):
-                batch = streamers[i : i + 100]
-                streams = await self._get_twitch_streams(batch)
-
-                if streams is None:
-                    self.logger.error(f"[Twitch] Failed to fetch streams for batch: {batch}")
-                    continue
-
-                stream_lookup: Dict[str, dict] = {
-                    stream["user_login"].lower(): stream for stream in streams
-                }
-
-                live_count = len(stream_lookup)
-                self.logger.debug(f"[Twitch] Batch {i // 100 + 1}: {live_count} live out of {len(batch)} streamers")
-
-                batch_subscriptions = [
-                    sub for sub in subscriptions if sub["twitch_username"] in batch
-                ]
-                for sub in batch_subscriptions:
-                    username = sub["twitch_username"]
-                    display_name = sub.get("display_name", username)
-                    guild_id = sub["guild_id"]
-                    notification_channel_id = sub["notification_channel_id"]
-
-                    current_stream = stream_lookup.get(username.lower())
-                    state = await get_stream_status(guild_id, username)
-                    was_live = state.get("is_live", False)
-                    notification_channel = self.bot.get_channel(
-                        int(notification_channel_id)
-                    )
-
-                    if not notification_channel:
-                        self.logger.error(
-                            f"[Twitch] Notification channel {notification_channel_id} not found for {display_name} (guild: {guild_id})"
-                        )
-
-                    if current_stream and not was_live:
-                        # Streamer went live
-                        self.logger.info(
-                            f"[Twitch] {display_name} went LIVE - Game: {current_stream.get('game_name', 'Unknown')}, "
-                            f"Viewers: {current_stream.get('viewer_count', 0)}"
-                        )
-                        message_id = None
-                        if notification_channel:
-                            try:
-                                message_id = await self._send_twitch_notification(
-                                    notification_channel, current_stream, "live"
-                                )
-                                self.logger.info(f"[Twitch] Sent live notification for {display_name}")
-                            except Exception as send_err:
-                                self.logger.error(
-                                    f"[Twitch] Failed to send live notification for {display_name}: {send_err}"
-                                )
-                        await update_stream_status(
-                            guild_id,
-                            username,
-                            True,
-                            current_stream["id"],
-                            message_id=message_id,
-                            user_id=current_stream.get("user_id"),
-                            user_login=current_stream.get("user_login"),
-                            display_name=current_stream.get("user_name"),
-                        )
-                    elif not current_stream and was_live:
-                        # Streamer went offline
-                        self.logger.info(f"[Twitch] {display_name} went OFFLINE")
-                        offline_payload = {
-                            "user_name": state.get("display_name")
-                            or sub.get("display_name")
-                            or username,
-                            "display_name": state.get("display_name")
-                            or sub.get("display_name")
-                            or username,
-                            "user_login": state.get("user_login") or username,
-                            "user_id": state.get("user_id"),
-                            "stream_id": state.get("stream_id"),
-                            "message_id": state.get("message_id"),
-                        }
-                        message_id = offline_payload["message_id"]
-                        if notification_channel:
-                            try:
-                                message_id = await self._send_twitch_notification(
-                                    notification_channel, offline_payload, "offline"
-                                )
-                                self.logger.info(f"[Twitch] Sent/edited offline notification for {display_name}")
-                            except Exception as send_err:
-                                self.logger.error(
-                                    f"[Twitch] Failed to send offline notification for {display_name}: {send_err}"
-                                )
-                        await update_stream_status(
-                            guild_id,
-                            username,
-                            False,
-                            None,
-                            message_id=message_id,
-                            user_id=offline_payload["user_id"],
-                            user_login=offline_payload["user_login"],
-                            display_name=offline_payload["display_name"],
-                        )
+            await self.twitch_transitions.poll()
         except Exception as e:
             self.logger.error(f"[Twitch] Error in check loop: {e}", exc_info=True)
 
@@ -635,7 +606,11 @@ class Notifications(commands.Cog):
                 }
 
     async def _send_twitch_notification(
-        self, channel: discord.TextChannel, stream_data: dict, status: str
+        self,
+        channel: discord.TextChannel,
+        stream_data: dict,
+        status: str,
+        vod_url: Optional[str] = None,
     ) -> Optional[str]:
         if status == "live":
             started_at = stream_data.get("started_at")
@@ -677,9 +652,6 @@ class Notifications(commands.Cog):
             or stream_data.get("user_name")
         )
         display_name = stream_data.get("display_name") or stream_data.get("user_name")
-        vod_url = await self._get_twitch_vod_url(
-            stream_data.get("user_id"), stream_data.get("stream_id"), user_login
-        )
         link_target = vod_url or (f"https://twitch.tv/{user_login}" if user_login else None)
         link_label = "Watch VOD" if vod_url else "Visit Channel"
 
