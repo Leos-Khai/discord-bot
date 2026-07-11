@@ -206,6 +206,17 @@ class GuildPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.voice.disconnected)
         self.assertEqual((), self.playback.queued_tracks)
 
+    async def test_starts_a_queued_track_after_external_audio_finishes(self):
+        self.voice.playing = True
+
+        queued = await self.playback.enqueue(TrackRequest("first"), "voice-1")
+        self.voice.playing = False
+        started = await self.playback.start_queued_if_idle()
+
+        self.assertEqual("queued", queued.kind)
+        self.assertEqual("started", started.kind)
+        self.assertEqual(["first"], [track.title for track in self.voice.played])
+
     async def test_starts_a_late_playlist_track_after_the_current_track_finishes(self):
         media = SlowPlaylistMedia()
         playback = GuildPlayback("guild-1", self.voice, media, self.volumes, self.outcomes)

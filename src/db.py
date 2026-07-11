@@ -62,6 +62,7 @@ class DatabaseService:
         self.custom_messages = self.db.custom_messages
         self.music_channel_limits = self.db.music_channel_limits
         self.guild_playback_settings = self.db.guild_playback_settings
+        self.user_tts_voices = self.db.user_tts_voices
         self.notification_channels = self.db.notification_channels
         self.youtube_subscriptions = self.db.youtube_subscriptions
         self.notified_videos = self.db.notified_videos
@@ -78,6 +79,7 @@ class DatabaseService:
         )
         await self.music_channel_limits.create_index("guild_id", unique=True)
         await self.guild_playback_settings.create_index("guild_id", unique=True)
+        await self.user_tts_voices.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
         await self.notification_channels.create_index("guild_id", unique=True)
         await self.youtube_subscriptions.create_index(
             [("guild_id", 1), ("youtube_channel_id", 1)], unique=True
@@ -277,6 +279,24 @@ class DatabaseService:
             {"guild_id": guild_id},
             {
                 "$set": {"volume": volume, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+    # ---- TTS ----------------------------------------------------------- #
+    async def get_tts_voice(self, guild_id: str, user_id: str) -> Optional[str]:
+        doc = await self.user_tts_voices.find_one(
+            {"guild_id": guild_id, "user_id": user_id}, {"_id": 0, "voice": 1}
+        )
+        return doc.get("voice") if doc else None
+
+    async def set_tts_voice(self, guild_id: str, user_id: str, voice: str) -> None:
+        now = datetime.utcnow()
+        await self.user_tts_voices.update_one(
+            {"guild_id": guild_id, "user_id": user_id},
+            {
+                "$set": {"voice": voice, "updated_at": now},
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
@@ -633,6 +653,14 @@ async def get_playback_volume(guild_id: str):
 
 async def set_playback_volume(guild_id: str, volume: float):
     return await _db_service.set_playback_volume(guild_id, volume)
+
+
+async def get_tts_voice(guild_id: str, user_id: str):
+    return await _db_service.get_tts_voice(guild_id, user_id)
+
+
+async def set_tts_voice(guild_id: str, user_id: str, voice: str):
+    return await _db_service.set_tts_voice(guild_id, user_id, voice)
 
 
 # Notifications

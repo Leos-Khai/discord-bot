@@ -166,6 +166,8 @@ class DiscordVoiceAdapter:
         source = self.guild.voice_client.source if self.guild.voice_client else None
         if isinstance(source, discord.PCMVolumeTransformer):
             source.volume = value
+        elif source and hasattr(source, "set_music_volume"):
+            source.set_music_volume(value)
 
 
 class MongoVolumeAdapter:
@@ -242,6 +244,11 @@ class MusicCommands(commands.Cog):
                 self.logger,
             )
         return self.playbacks[guild_id]
+
+    async def start_queued_if_idle(self, guild_id: str) -> None:
+        playback = self.playbacks.get(guild_id)
+        if playback:
+            await playback.start_queued_if_idle()
 
     async def _voice_channel(self, ctx):
         if not ctx.author.voice:
@@ -404,7 +411,12 @@ class MusicCommands(commands.Cog):
         playback = self.playbacks.pop(guild_id, None)
         self.outcomes.pop(guild_id, None)
         if not playback:
-            await ctx.send("Nothing is playing.")
+            client = ctx.guild.voice_client
+            if client and client.is_connected():
+                await client.disconnect()
+                await ctx.send("Disconnected.")
+            else:
+                await ctx.send("Nothing is playing.")
             return
         await playback.close()
         await ctx.send("Stopped playback and disconnected.")

@@ -257,6 +257,21 @@ class GuildPlayback:
             self._voice.stop()
             return PlaybackOutcome("skipped", self._current)
 
+    async def start_queued_if_idle(self) -> Optional[PlaybackOutcome]:
+        """Starts a queued track after another audio feature releases the voice client."""
+        async with self._lock:
+            if (
+                self._closed
+                or self._current
+                or not self._queue
+                or self._voice.is_playing()
+                or self._voice.is_paused()
+            ):
+                return None
+            outcome = await self._start_locked(self._queue.pop(0))
+        await self._outcomes.publish(outcome)
+        return outcome
+
     async def remove(self, argument: str) -> PlaybackOutcome:
         async with self._lock:
             if argument.lower() == "all":
