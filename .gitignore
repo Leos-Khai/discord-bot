@@ -166,3 +166,4 @@ cython_debug/
 /graphify-out
 /.agents
 /.codex
+/.claude
