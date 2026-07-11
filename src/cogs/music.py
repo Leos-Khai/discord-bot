@@ -1,97 +1,215 @@
+import asyncio
+import functools
+import re
+from typing import Optional
+
 import discord
 from discord.ext import commands
-import re
-import datetime
 import yt_dlp as youtube_dl
-import os
-import json
-from cogs.admin import is_admin
-import functools
+
+from db import get_music_channels, get_playback_volume, set_playback_volume
+from guild_playback import GuildPlayback, OutcomeKind, PlaybackOutcome, Track, TrackRequest
 from logger import get_logger
-import asyncio
-from db import get_music_channels
 
 youtube_dl.utils.bug_reports_message = lambda *args, **kwargs: ""
 
-# Updated YDL_OPTIONS with better format selection and error handling
 YDL_OPTIONS = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-    "noplaylist": False,
     "quiet": True,
-    "force-ipv4": True,
-    "extract_flat": "in_playlist",
+    "forceipv4": True,
     "ignoreerrors": True,
     "nocheckcertificate": True,
     "extractor_retries": 3,
     "skip_download": True,
     "no_warnings": True,
-    # Remove complex format_sort that might be causing issues
-    # YouTube specific options - simplified
     "youtube_include_dash_manifest": False,
     "prefer_free_formats": True,
-    # Add cookies support if needed
-    "cookiefile": None,
-    # Add user agent
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0.4472.124 Safari/537.36",
 }
 
-# Updated FFMPEG options with better reconnect handling
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1",
     "options": "-vn -bufsize 512k -maxrate 128k",
 }
 
 
+class YtdlpMediaAdapter:
+    def __init__(self, logger):
+        self.logger = logger
+
+    async def _extract(self, target: str, *, flat: bool, playlist: bool, format_option=None):
+        options = YDL_OPTIONS.copy()
+        options.update({"extract_flat": flat, "noplaylist": not playlist, "socket_timeout": 30})
+        if format_option:
+            options["format"] = format_option
+        ydl = youtube_dl.YoutubeDL(options)
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, functools.partial(ydl.extract_info, target, download=False)),
+            timeout=60.0 if playlist else 45.0,
+        )
+
+    async def resolve(self, request: TrackRequest) -> Track:
+        data = None
+        last_error = None
+        for format_option in ("bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio", "best[height<=720]/best", "worst"):
+            try:
+                data = await self._extract(request.target, flat=False, playlist=False, format_option=format_option)
+                if data:
+                    break
+            except Exception as error:
+                last_error = error
+                self.logger.warning("Failed to resolve '%s' with %s: %s", request.target, format_option, error)
+        if not data:
+            raise RuntimeError("Could not find a playable audio source") from last_error
+        if data.get("entries"):
+            entry = next((item for item in data["entries"] if item), None)
+            if not entry:
+                raise RuntimeError("Could not find a playable audio source")
+            target = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+            if not target:
+                raise RuntimeError("Could not find a playable audio source")
+            return await self.resolve(TrackRequest(target))
+        stream_url = data.get("url")
+        if not stream_url or stream_url.startswith("file://"):
+            raise RuntimeError("Could not find a playable audio source")
+        return Track(
+            title=data.get("title") or request.title or "Unknown Title",
+            stream_url=stream_url,
+            webpage_url=data.get("webpage_url") or request.target,
+            duration=data.get("duration") or request.duration,
+            uploader=data.get("uploader"),
+            thumbnail=data.get("thumbnail"),
+        )
+
+    async def playlist_entries(self, request: TrackRequest) -> list[TrackRequest]:
+        match = re.search(r"[?&]list=([A-Za-z0-9_-]+)", request.target)
+        target = f"https://www.youtube.com/playlist?list={match.group(1)}" if match else request.target
+        data = await self._extract(target, flat=True, playlist=True)
+        entries = data.get("entries", []) if data else []
+        return [
+            TrackRequest(
+                entry.get("webpage_url") or entry.get("url") or entry.get("id"),
+                entry.get("title") or "Unknown Title",
+                entry.get("duration"),
+            )
+            for entry in entries[:250]
+            if entry and (entry.get("webpage_url") or entry.get("url") or entry.get("id"))
+        ]
+
+    async def search(self, query: str) -> list[TrackRequest]:
+        data = await self._extract(f"ytsearch5:{query}", flat=True, playlist=False)
+        return [
+            TrackRequest(
+                entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry.get('id')}",
+                entry.get("title") or "Unknown Title",
+                entry.get("duration"),
+            )
+            for entry in (data or {}).get("entries", [])[:5]
+            if entry
+        ]
+
+
+class DiscordVoiceAdapter:
+    def __init__(self, guild: discord.Guild):
+        self.guild = guild
+
+    async def ensure_connected(self, channel: discord.VoiceChannel) -> None:
+        client = self.guild.voice_client
+        if client is None:
+            await channel.connect()
+        elif client.channel != channel:
+            await client.move_to(channel)
+
+    async def play(self, track: Track, volume: float, after) -> None:
+        client = self.guild.voice_client
+        if not client or not client.is_connected():
+            raise RuntimeError("Voice client unavailable for playback")
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS), volume=volume
+        )
+        client.play(source, after=after)
+
+    def is_playing(self) -> bool:
+        return bool(self.guild.voice_client and self.guild.voice_client.is_playing())
+
+    def is_paused(self) -> bool:
+        return bool(self.guild.voice_client and self.guild.voice_client.is_paused())
+
+    def pause(self) -> None:
+        if self.guild.voice_client:
+            self.guild.voice_client.pause()
+
+    def resume(self) -> None:
+        if self.guild.voice_client:
+            self.guild.voice_client.resume()
+
+    def stop(self) -> None:
+        if self.guild.voice_client:
+            self.guild.voice_client.stop()
+
+    async def disconnect(self) -> None:
+        if self.guild.voice_client:
+            await self.guild.voice_client.disconnect()
+
+    def set_volume(self, value: float) -> None:
+        source = self.guild.voice_client.source if self.guild.voice_client else None
+        if isinstance(source, discord.PCMVolumeTransformer):
+            source.volume = value
+
+
+class MongoVolumeAdapter:
+    async def load(self, guild_id: str) -> float:
+        return await get_playback_volume(guild_id)
+
+    async def save(self, guild_id: str, value: float) -> None:
+        await set_playback_volume(guild_id, value)
+
+
+class DiscordOutcomeAdapter:
+    def __init__(self):
+        self.channel: Optional[discord.abc.Messageable] = None
+
+    def use_channel(self, channel: discord.abc.Messageable) -> None:
+        self.channel = channel
+
+    async def publish(self, outcome: PlaybackOutcome) -> None:
+        if not self.channel:
+            return
+        if outcome.kind == OutcomeKind.STARTED and outcome.track:
+            await self.channel.send(f"Now playing: **{outcome.track.title}**")
+        elif outcome.kind == OutcomeKind.PLAYLIST_LOADING:
+            await self.channel.send(f"Loading {outcome.detail} playlist track(s) in the background…")
+        elif outcome.kind == OutcomeKind.PLAYLIST_COMPLETE:
+            await self.channel.send("Playlist loading complete.")
+        elif outcome.kind == OutcomeKind.FAILED and outcome.detail:
+            await self.channel.send(f"Playback issue: {outcome.detail}")
+
+
 class MusicCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.logger = get_logger()
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.volumes_file = os.path.join(script_dir, "..", "volumes.json")
-        if os.path.exists(self.volumes_file):
-            try:
-                with open(self.volumes_file, "r") as f:
-                    self.volumes = json.load(f)
-            except Exception as e:
-                self.logger.error(f"Error loading volumes file: {e}")
-                self.volumes = {}
-        else:
-            self.volumes = {}
-        self.queues = {}
-        self.current_tracks = {}
-        self.loading_queues = {}
-        self.loading_tasks = {}
-        self.loading_locks = {}
-        self.play_next_events = {}
-        self.is_seeking = {}
-        self.playback_start_time = {}
-        self.playback_seek_position = {}
-        self.pause_start_time = {}
-        self.allowed_channels_cache = {}
+        self.media = YtdlpMediaAdapter(self.logger)
+        self.playbacks: dict[str, GuildPlayback] = {}
+        self.outcomes: dict[str, DiscordOutcomeAdapter] = {}
+        self.allowed_channels_cache: dict[str, set[int]] = {}
 
-    async def _get_allowed_channels(self, guild_id: str):
-        """Fetch allowed text channels for music commands, cached per guild."""
-        if guild_id in self.allowed_channels_cache:
-            return self.allowed_channels_cache[guild_id]
-        channels = await get_music_channels(guild_id)
-        allowed_set = {int(cid) for cid in channels}
-        self.allowed_channels_cache[guild_id] = allowed_set
-        return allowed_set
+    async def _get_allowed_channels(self, guild_id: str) -> set[int]:
+        if guild_id not in self.allowed_channels_cache:
+            self.allowed_channels_cache[guild_id] = {int(channel) for channel in await get_music_channels(guild_id)}
+        return self.allowed_channels_cache[guild_id]
 
     async def refresh_allowed_channels_cache(self, guild_id: str):
-        """Refresh allowed channel cache after admin updates."""
-        if guild_id in self.allowed_channels_cache:
-            self.allowed_channels_cache.pop(guild_id, None)
+        self.allowed_channels_cache.pop(guild_id, None)
         await self._get_allowed_channels(guild_id)
 
     async def cog_check(self, ctx):
-        """Restrict music commands to allowed channels if configured."""
         if not ctx.guild:
             return False
-        allowed_channels = await self._get_allowed_channels(str(ctx.guild.id))
-        if allowed_channels and ctx.channel.id not in allowed_channels:
-            mentions = ", ".join(f"<#{cid}>" for cid in allowed_channels)
-            await ctx.send(f"Music commands are limited to: {mentions}")
+        allowed = await self._get_allowed_channels(str(ctx.guild.id))
+        if allowed and ctx.channel.id not in allowed:
+            await ctx.send("Music commands are limited to: " + ", ".join(f"<#{channel}>" for channel in allowed))
             return False
         return True
 
@@ -100,977 +218,211 @@ class MusicCommands(commands.Cog):
             return
         raise error
 
-    def get_guild_queue(self, gid):
-        if gid not in self.queues:
-            self.queues[gid] = []
-        if gid not in self.loading_queues:
-            self.loading_queues[gid] = []
-        if gid not in self.loading_locks:
-            self.loading_locks[gid] = asyncio.Lock()
-        if gid not in self.play_next_events:
-            self.play_next_events[gid] = asyncio.Event()
-        return self.queues[gid]
-
-    def _format_duration(self, seconds: float) -> str:
-        """Formats seconds into HH:MM:SS or MM:SS string."""
-        if seconds is None:
-            return "N/A"
-        try:
-            seconds = int(float(seconds))
-        except (ValueError, TypeError):
-            return "N/A"
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        else:
-            return f"{minutes:02d}:{seconds:02d}"
-
-    def _get_current_position(self, gid: str) -> float | None:
-        """Estimates the current playback position in seconds."""
-        loop = self.bot.loop
-        start_time = self.playback_start_time.get(gid)
-        seek_pos = self.playback_seek_position.get(gid, 0.0)
-        pause_start = self.pause_start_time.get(gid)
-
-        if start_time is None:
-            return None
-
-        current_time = loop.time()
-        elapsed_time = current_time - start_time
-
-        if pause_start:
-            time_paused = current_time - pause_start
-            elapsed_time -= time_paused
-
-        elapsed_time = max(0.0, elapsed_time)
-
-        return seek_pos + elapsed_time
-
-    async def _start_track(self, ctx, gid: str, track: dict, announce: bool = True):
-        """Start playback for a prepared track and update state."""
-        vc = ctx.guild.voice_client
-        if not vc or not vc.is_connected():
-            raise RuntimeError("Voice client unavailable for playback.")
-
-        if not track or "url" not in track:
-            raise ValueError("Track is missing stream URL.")
-
-        volume = self.volumes.get(gid, 1.0)
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(track["url"], **FFMPEG_OPTIONS),
-            volume=volume,
-        )
-
-        def _after(error_arg):
-            self.handle_after_play(error_arg, ctx, gid)
-
-        vc.play(source, after=_after)
-
-        loop = self.bot.loop
-        self.playback_start_time[gid] = loop.time()
-        self.playback_seek_position[gid] = 0.0
-        self.pause_start_time.pop(gid, None)
-        self.current_tracks[gid] = track
-
-        if announce and ctx and ctx.channel:
-            await ctx.send(f"Now playing: **{track.get('title', 'Unknown')}**")
-
-    async def _fetch_track_info(self, url_or_id):
-        """Fetches full track info for a single URL or ID. Runs in executor."""
-        loop = self.bot.loop
-
-        # Simplified format selection - try these in order
-        formats_to_try = [
-            "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
-            "best[height<=720]/best",
-            "worst",  # Last resort
-        ]
-
-        for format_option in formats_to_try:
-            try:
-                ydl_opts = YDL_OPTIONS.copy()
-                ydl_opts["format"] = format_option
-                ydl_opts["noplaylist"] = True
-                # Force full extraction so we can resolve stream URLs from searches/playlists
-                ydl_opts["extract_flat"] = False
-
-                # Add timeout to prevent hanging
-                ydl_opts["socket_timeout"] = 30
-
-                ydl = youtube_dl.YoutubeDL(ydl_opts)
-
-                # Add timeout to the executor call
-                try:
-                    data = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                ydl.extract_info, url_or_id, download=False
-                            ),
-                        ),
-                        timeout=45.0,  # 45 second timeout
-                    )
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout fetching track info for {url_or_id}")
-                    continue
-
-                if not data:
-                    continue
-
-                # If we got a search/playlist result, dig into the first entry and resolve it
-                if data.get("entries"):
-                    first_entry = next((entry for entry in data["entries"] if entry), None)
-                    if not first_entry:
-                        continue
-                    entry_target = (
-                        first_entry.get("webpage_url")
-                        or first_entry.get("url")
-                        or first_entry.get("id")
-                    )
-                    if entry_target:
-                        return await self._fetch_track_info(entry_target)
-                    continue
-
-                stream_url = data.get("url")
-                if stream_url and not stream_url.startswith("file://"):
-                    return data
-
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch track with format {format_option}: {str(e)}"
-                )
-                continue
-
-        raise Exception("Could not extract audio information with any available format")
-
-    def _canonical_playlist_url(self, url: str) -> str:
-        """Normalize a YouTube playlist URL so yt-dlp reliably expands it."""
-        match = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url)
-        if match:
-            list_id = match.group(1)
-            return f"https://www.youtube.com/playlist?list={list_id}"
-        return url
-
-    async def _fetch_playlist_tracks(self, playlist_url: str, limit: int = 250):
-        """Fetch playlist entries (metadata only). Actual streams resolved lazily."""
-        loop = self.bot.loop
-        ydl_opts = YDL_OPTIONS.copy()
-        ydl_opts["noplaylist"] = False
-        ydl_opts["extract_flat"] = True  # enumerate entries quickly
-        ydl_opts["socket_timeout"] = 30
-
-        ydl = youtube_dl.YoutubeDL(ydl_opts)
-
-        try:
-            info = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, functools.partial(ydl.extract_info, playlist_url, download=False)
-                ),
-                timeout=60.0,
+    def _playback(self, ctx) -> GuildPlayback:
+        guild_id = str(ctx.guild.id)
+        publisher = self.outcomes.setdefault(guild_id, DiscordOutcomeAdapter())
+        publisher.use_channel(ctx.channel)
+        if guild_id not in self.playbacks:
+            self.playbacks[guild_id] = GuildPlayback(
+                guild_id,
+                DiscordVoiceAdapter(ctx.guild),
+                self.media,
+                MongoVolumeAdapter(),
+                publisher,
+                self.logger,
             )
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Timeout fetching playlist info for {playlist_url}")
-            return []
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch playlist {playlist_url}: {e}")
-            return []
+        return self.playbacks[guild_id]
 
-        entries = [entry for entry in info.get("entries", []) if entry]
-        if not entries:
-            return []
-
-        playlist_entries = []
-        for entry in entries[:limit]:
-            entry_target = (
-                entry.get("webpage_url") or entry.get("url") or entry.get("id")
-            )
-            if not entry_target:
-                continue
-            playlist_entries.append(
-                {
-                    "target": entry_target,
-                    "title": entry.get("title") or "Unknown Title",
-                    "duration": entry.get("duration"),
-                }
-            )
-
-        return playlist_entries
-
-    async def _background_load_playlist(self, ctx, gid: str):
-        """Resolve playlist entries into playable tracks without blocking the main command."""
-        loading_queue = self.loading_queues.get(gid, [])
-        play_next_event = self.play_next_events.get(gid)
-
-        while loading_queue:
-            entry = loading_queue.pop(0)
-            entry_target = entry.get("target")
-            if not entry_target:
-                continue
-            try:
-                full = await self._fetch_track_info(entry_target)
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to resolve playlist entry {entry_target}: {e}"
-                )
-                continue
-
-            if not full or "url" not in full:
-                continue
-
-            track = {
-                "title": full.get("title") or entry.get("title") or "Unknown Title",
-                "url": full.get("url"),
-                "duration": full.get("duration") or entry.get("duration"),
-                "webpage_url": full.get("webpage_url") or entry_target,
-            }
-            queue = self.get_guild_queue(gid)
-            queue.append(track)
-            if play_next_event:
-                play_next_event.set()
-
-        # cleanup task record
-        self.loading_tasks.pop(gid, None)
-
-    async def play_next(self, ctx, gid):
-        """Plays the next track in the queue or waits for the background loader."""
-        queue = self.get_guild_queue(gid)
-        play_next_event = self.play_next_events.get(gid)
-
-        if queue:
-            volume = self.volumes.get(gid, 1.0)
-            next_track = queue.pop(0)
-
-            vc = ctx.guild.voice_client
-            if not vc or not vc.is_connected():
-                self.logger.warning(
-                    f"play_next called for GID {gid} but voice client is disconnected."
-                )
-                self.current_tracks[gid] = None
-                return
-
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    # Use existing stream URL first; refresh only if missing or a previous attempt failed.
-                    if attempt > 0 or not next_track.get("url"):
-                        fresh_target = next_track.get("webpage_url") or next_track.get("url")
-                        if fresh_target:
-                            fresh_track = await self._fetch_track_info(fresh_target)
-                            if fresh_track and "url" in fresh_track:
-                                next_track["url"] = fresh_track["url"]
-                    await self._start_track(ctx, gid, next_track, announce=True)
-                    break  # Success, exit retry loop
-
-                except Exception as e:
-                    self.logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-                    if attempt == max_retries - 1:  # Last attempt
-                        if ctx and ctx.channel:
-                            await ctx.send(
-                                f"❌ Failed to play: **{next_track.get('title', 'Unknown')}** - Skipping..."
-                            )
-                        self.logger.error(
-                            f"Error in play_next starting track {next_track.get('title', 'N/A')}: {e}"
-                        )
-                        # Try next track
-                        self.bot.loop.create_task(self.play_next(ctx, gid))
-                    else:
-                        await asyncio.sleep(1)  # Wait before retry
-
-        else:
-            loader_task = self.loading_tasks.get(gid)
-            if loader_task and not loader_task.done():
-                self.logger.info(
-                    f"play_next for GID {gid}: Queue empty, waiting for background loader..."
-                )
-                while True:
-                    try:
-                        await asyncio.wait_for(play_next_event.wait(), timeout=30.0)
-                        play_next_event.clear()
-                        self.logger.info(
-                            f"play_next for GID {gid}: Loader added track, retrying..."
-                        )
-                        self.bot.loop.create_task(self.play_next(ctx, gid))
-                        return
-                    except asyncio.TimeoutError:
-                        if loader_task.done():
-                            break
-                        # keep waiting while loader runs
-                        continue
-                    except Exception as e:
-                        self.logger.error(
-                            f"Error waiting for play_next_event for GID {gid}: {e}"
-                        )
-                        self.current_tracks[gid] = None
-                        return
-                # Loader finished but nothing queued
-                self.logger.info(
-                    f"play_next for GID {gid}: Loader finished with no tracks. Playback finished."
-                )
-                self.current_tracks[gid] = None
-            else:
-                self.logger.info(
-                    f"play_next for GID {gid}: Queue empty and no active loader. Playback finished."
-                )
-                self.current_tracks[gid] = None
-
-    def handle_after_play(self, error, ctx, gid):
-        """Callback function for after a track finishes playing or errors."""
-        if self.is_seeking.pop(gid, None):
-            self.logger.debug(f"handle_after_play skipped for GID {gid} due to seek.")
-            return
-        if error:
-            self.logger.error(f"Error after playing track for GID {gid}: {error}")
-
-        self.bot.loop.create_task(self.play_next(ctx, gid))
-
-    async def _ensure_voice(self, ctx):
-        """Checks if the user is in a voice channel and connects/moves the bot."""
+    async def _voice_channel(self, ctx):
         if not ctx.author.voice:
             await ctx.send("You are not connected to a voice channel.")
-            return False
+            return None
+        return ctx.author.voice.channel
 
-        channel = ctx.author.voice.channel
-        if ctx.voice_client is None:
-            try:
-                await channel.connect()
-                await ctx.send(f"Joined **{channel.name}**!")
-            except Exception as e:
-                await ctx.send(f"Error connecting to voice channel: {e}")
-                self.logger.error(f"Error connecting to voice channel: {e}")
-                return False
-        elif ctx.voice_client.channel != channel:
-            try:
-                await ctx.voice_client.move_to(channel)
-                await ctx.send(f"Moved to **{channel.name}**!")
-            except Exception as e:
-                await ctx.send(f"Error moving voice channel: {e}")
-                self.logger.error(f"Error moving voice channel: {e}")
-                return False
-        return True
+    @staticmethod
+    def _format_duration(seconds: Optional[float]) -> str:
+        if seconds is None:
+            return "N/A"
+        minutes, seconds = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
-    @commands.hybrid_command(
-        help="Have the bot join your current voice channel without starting playback.\nUsage: !join"
-    )
+    async def _send_enqueue_outcome(self, ctx, outcome: PlaybackOutcome):
+        if outcome.kind == OutcomeKind.STARTED and outcome.track:
+            await ctx.send(f"Now playing: **{outcome.track.title}**")
+        elif outcome.kind == OutcomeKind.QUEUED and outcome.track:
+            await ctx.send(f"Added to queue: **{outcome.track.title}**")
+        elif outcome.kind == OutcomeKind.FAILED:
+            await ctx.send(f"Unable to play: {outcome.detail}")
+
+    @commands.hybrid_command(help="Have the bot join your current voice channel.")
     async def join(self, ctx):
-        if not await self._ensure_voice(ctx):
-            return
-        # If we were already in the user's channel, give a quick confirmation.
-        if (
-            ctx.voice_client
-            and ctx.author.voice
-            and ctx.voice_client.channel == ctx.author.voice.channel
-        ):
-            await ctx.send(f"Already in **{ctx.voice_client.channel.name}**.")
+        channel = await self._voice_channel(ctx)
+        if channel:
+            await self._playback(ctx).join(channel)
+            await ctx.send(f"Connected to **{channel.name}**.")
 
-    @commands.hybrid_command(
-        help=(
-            "Play a YouTube URL, playlist, or search query.\n"
-            "Usage: !play <url|search terms>\n"
-            "Automatically joins your voice channel."
-        )
-    )
+    @commands.hybrid_command(help="Play a YouTube URL, playlist, or search query.")
     async def play(self, ctx, *, query: str):
         if not query:
             await ctx.send("Please provide a URL or search terms to play.")
             return
-
-        if not await self._ensure_voice(ctx):
+        channel = await self._voice_channel(ctx)
+        if not channel:
             return
-
-        # Slash commands timeout quickly; defer to buy time for yt-dlp fetches.
         if ctx.interaction and not ctx.interaction.response.is_done():
             await ctx.defer()
-
-        gid = str(ctx.guild.id)
-        queue = self.get_guild_queue(gid)
-
+        playback = self._playback(ctx)
         target = query.strip()
-        is_url = re.match(r"https?://", target)
-        is_playlist_url = is_url and re.search(r"[?&]list=", target) is not None
+        is_playlist = bool(re.match(r"https?://", target) and re.search(r"[?&]list=", target))
+        outcome = await (
+            playback.enqueue_playlist(TrackRequest(target), channel)
+            if is_playlist
+            else playback.enqueue(TrackRequest(target), channel)
+        )
+        await self._send_enqueue_outcome(ctx, outcome)
 
-        # Playlist expansion (first track plays, rest resolved in background)
-        if is_playlist_url:
-            try:
-                playlist_url = self._canonical_playlist_url(target)
-                entries = await self._fetch_playlist_tracks(playlist_url)
-            except Exception as e:
-                entries = []
-                self.logger.error(
-                    f"Failed to expand playlist for '{target}' in GID {gid}: {e}"
-                )
-            if entries:
-                # Cancel any previous loader
-                existing = self.loading_tasks.get(gid)
-                if existing and not existing.done():
-                    existing.cancel()
-
-                # Resolve first playable entry; keep the rest for background loading
-                first_track = None
-                remaining_entries = list(entries)
-                while remaining_entries and not first_track:
-                    candidate = remaining_entries.pop(0)
-                    try:
-                        candidate_full = await self._fetch_track_info(candidate["target"])
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Error resolving playlist entry {candidate.get('target')}: {e}"
-                        )
-                        continue
-                    url = candidate_full.get("url")
-                    if not url:
-                        continue
-                    first_track = {
-                        "title": candidate_full.get("title")
-                        or candidate.get("title")
-                        or "Unknown Title",
-                        "url": url,
-                        "duration": candidate_full.get("duration")
-                        or candidate.get("duration"),
-                        "webpage_url": candidate_full.get("webpage_url")
-                        or candidate.get("target"),
-                    }
-
-                if not first_track:
-                    await ctx.send("Couldn't find a playable track in that playlist.")
-                    return
-
-                loading_queue = self.loading_queues.setdefault(gid, [])
-                loading_queue.clear()
-                loading_queue.extend(remaining_entries)
-
-                if ctx.voice_client and ctx.voice_client.is_playing():
-                    queue.append(first_track)
-                    await ctx.send(
-                        f"Queued first playlist track: **{first_track['title']}**\n"
-                        f"Loading {len(loading_queue)} more in the background..."
-                    )
-                else:
-                    try:
-                        await self._start_track(ctx, gid, first_track, announce=False)
-                        await ctx.send(
-                            f"Now playing: **{first_track['title']}**\n"
-                            f"Loading {len(loading_queue)} more from playlist..."
-                        )
-                    except Exception as e:
-                        await ctx.send(f"Unable to start first playlist track: {e}")
-                        self.logger.error(
-                            f"Error starting playlist track for GID {gid}: {e}"
-                        )
-                        return
-
-                if loading_queue:
-                    task = self.bot.loop.create_task(self._background_load_playlist(ctx, gid))
-                    self.loading_tasks[gid] = task
-                return
-            # If playlist expansion failed, fall through to single track handling
-
-        ydl_target = target if is_url else f"ytsearch1:{target}"
-
-        try:
-            track_info = await self._fetch_track_info(ydl_target)
-        except Exception as e:
-            await ctx.send(f"Unable to fetch track: {e}")
-            self.logger.error(
-                f"Failed to fetch track for '{query}' in GID {gid}: {e}"
-            )
-            return
-
-        if not track_info or "url" not in track_info:
-            await ctx.send("Couldn't find a playable audio source for that request.")
-            return
-
-        track = {
-            "title": track_info.get("title") or "Unknown Title",
-            "url": track_info.get("url"),
-            "duration": track_info.get("duration"),
-            "webpage_url": track_info.get("webpage_url") or track_info.get("url"),
-        }
-
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            queue.append(track)
-            await ctx.send(f"Added to queue: **{track['title']}**")
-        else:
-            try:
-                await self._start_track(ctx, gid, track, announce=False)
-                await ctx.send(f"Now playing: **{track['title']}**")
-            except Exception as e:
-                await ctx.send(f"Error starting playback: {e}")
-                self.logger.error(
-                    f"Error starting playback for {track.get('title', 'N/A')} in GID {gid}: {e}"
-                )
-
-    @commands.hybrid_command(
-        help="Search YouTube and choose a song to play.\nUsage: !search <query>\nShows top 5 results and lets you choose.\nExample: !search never gonna give you up"
-    )
+    @commands.hybrid_command(help="Search YouTube and choose a result.")
     async def search(self, ctx, *, query: str):
-        if not ctx.voice_client:
-            if ctx.author.voice:
-                if not await self._ensure_voice(ctx):
-                    return
-            else:
-                await ctx.send("You must be in a voice channel to play audio.")
-                return
-        elif not await self._ensure_voice(ctx):
+        channel = await self._voice_channel(ctx)
+        if not channel:
             return
-
         if ctx.interaction and not ctx.interaction.response.is_done():
             await ctx.defer()
-
-        gid = str(ctx.guild.id)
-        loop = self.bot.loop
-        await ctx.send(f"🔍 Searching YouTube for '{query}'...")
-
+        await ctx.send(f"Searching YouTube for '{query}'...")
         try:
-            ydl_opts_search = YDL_OPTIONS.copy()
-            ydl_opts_search["noplaylist"] = True
-            ydl_opts_search["socket_timeout"] = 30
-            ydl = youtube_dl.YoutubeDL(ydl_opts_search)
-
-            info = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        ydl.extract_info, f"ytsearch5:{query}", download=False
-                    ),
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            await ctx.send(f"❌ Search timed out for '{query}'.")
+            entries = await self.media.search(query)
+        except Exception as error:
+            self.logger.warning("Search failed for '%s': %s", query, error)
+            await ctx.send(f"Search failed: {error}")
             return
-        except Exception as e:
-            await ctx.send(f"❌ Error processing search: {e}")
-            self.logger.error(f"Error processing search '{query}': {e}")
-            return
-
-        entries = info.get("entries", [])
         if not entries:
-            await ctx.send("? No results found.")
+            await ctx.send("No results found.")
             return
-
-        entries = entries[:5]
-        lines = []
-        for i, entry in enumerate(entries, start=1):
-            duration = entry.get("duration")
-            duration_str = f" ({self._format_duration(duration)})" if duration else ""
-            lines.append(f"{i}. {entry.get('title', 'Unknown Title')}{duration_str}")
-
-        embed = discord.Embed(
-            title="Search Results",
-            description="\n".join(lines),
-            color=0x5865F2,
-        )
+        lines = [f"{i}. {entry.title} ({self._format_duration(entry.duration)})" for i, entry in enumerate(entries, 1)]
+        embed = discord.Embed(title="Search Results", description="\n".join(lines), color=discord.Color.blurple())
         embed.set_footer(text="React with 1-5 to choose. Expires in 30s.")
-        msg = await ctx.send(embed=embed)
-
-        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-        available_emojis = number_emojis[: len(entries)]
-        for emoji in available_emojis:
+        message = await ctx.send(embed=embed)
+        emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"][: len(entries)]
+        for emoji in emojis:
             try:
-                await msg.add_reaction(emoji)
+                await message.add_reaction(emoji)
             except discord.Forbidden:
-                await ctx.send("❌ I need permission to add reactions in this channel.")
+                await ctx.send("I need permission to add reactions in this channel.")
                 return
-            except discord.HTTPException:
-                pass
 
-        def reaction_check(reaction, user):
-            return (
-                user == ctx.author
-                and reaction.message.id == msg.id
-                and str(reaction.emoji) in available_emojis
-            )
+        def selected(reaction, user):
+            return user == ctx.author and reaction.message.id == message.id and str(reaction.emoji) in emojis
 
         try:
-            reaction, user = await self.bot.wait_for(
-                "reaction_add", timeout=30.0, check=reaction_check
-            )
+            reaction, user = await self.bot.wait_for("reaction_add", timeout=30.0, check=selected)
         except asyncio.TimeoutError:
-            embed.set_footer(text="Selection timed out.")
-            try:
-                await msg.edit(embed=embed)
-            except discord.HTTPException:
-                pass
+            await ctx.send("Selection timed out.")
             return
+        request = entries[emojis.index(str(reaction.emoji))]
+        outcome = await self._playback(ctx).enqueue(request, channel)
+        await self._send_enqueue_outcome(ctx, outcome)
 
-        selection = available_emojis.index(str(reaction.emoji))
-        selected_entry = entries[selection]
-
-        selected_url = selected_entry.get("webpage_url") or selected_entry.get("url")
-        if selected_url and not selected_url.startswith("http"):
-            selected_url = f"https://www.youtube.com/watch?v={selected_url}"
-        try:
-            fetched = await self._fetch_track_info(selected_url)
-        except Exception as e:
-            await ctx.send(f"❌ Error fetching track details: {e}")
-            self.logger.error(
-                f"Error fetching selected search track {selected_url}: {e}"
-            )
-            return
-
-        track_info = {
-            "url": fetched.get("url"),
-            "title": fetched.get("title", selected_entry.get("title", "Unknown Title")),
-            "webpage_url": fetched.get("webpage_url") or selected_url,
-            "duration": fetched.get("duration", selected_entry.get("duration")),
-        }
-        if not track_info["url"]:
-            await ctx.send("❌ Couldn't find a playable source for that selection.")
-            return
-
-        queue = self.get_guild_queue(gid)
-        embed.description = "\n".join(
-            [
-                f"**{lines[selection]}** ← selected" if i == selection else line
-                for i, line in enumerate(lines)
-            ]
-        )
-        embed.set_footer(
-            text=(
-                f"Selected {selection + 1}: {track_info.get('title', 'Unknown Title')} "
-                f"({self._format_duration(track_info.get('duration'))})"
-            )
-        )
-        try:
-            await msg.edit(embed=embed)
-        except discord.HTTPException:
-            pass
-
-        try:
-            await msg.remove_reaction(reaction.emoji, user)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-        if ctx.voice_client.is_playing():
-            queue.append(track_info)
-            await ctx.send(f"➕ Added to queue: **{track_info['title']}**")
-        else:
-            try:
-                await self._start_track(ctx, gid, track_info, announce=False)
-                await ctx.send(f"🎶 Now playing: **{track_info['title']}**")
-            except Exception as e:
-                await ctx.send(f"❌ Error starting playback for selected track: {e}")
-                self.logger.error(
-                    f"Error playing selected search track {track_info.get('title', 'N/A')}: {e}"
-                )
-
-
-
-
-    @commands.hybrid_command(
-        name="queue",
-        help="Display the current queue.\nUsage: !queue\nShows up to 10 upcoming tracks."
-    )
+    @commands.hybrid_command(name="queue", help="Display the current queue.")
     async def queue_list(self, ctx):
-        gid = str(ctx.guild.id)
-        queue = self.queues.get(gid, [])
-        loading_queue = self.loading_queues.get(gid, [])
-
-        msg = ""
-        current = self.current_tracks.get(gid)
-        if current:
-            duration = current.get("duration")
-            duration_str = f" ({self._format_duration(duration)})" if duration else ""
-            msg += f"🎵 **Now Playing:** {current['title']}{duration_str}\n\n"
-
-        if not queue and not loading_queue and not current:
-            await ctx.send("📭 The queue is empty and nothing is loading.")
+        playback = self._playback(ctx)
+        current = playback.current_track
+        queued = playback.queued_tracks
+        if not current and not queued and not playback.is_loading:
+            await ctx.send("The queue is empty and nothing is loading.")
             return
+        lines = []
+        if current:
+            lines.append(f"Now playing: **{current.title}**")
+        lines.extend(f"{i}. {track.title}" for i, track in enumerate(queued[:10], 1))
+        if playback.is_loading:
+            lines.append("More playlist tracks are loading…")
+        await ctx.send("\n".join(lines))
 
-        if queue:
-            msg += f"📋 **Queue ({len(queue)} song(s)):**\n"
-            for i, track in enumerate(queue[:10], start=1):
-                duration = track.get("duration")
-                duration_str = (
-                    f" ({self._format_duration(duration)})" if duration else ""
-                )
-                msg += f"{i}. {track['title']}{duration_str}\n"
-            if len(queue) > 10:
-                msg += f"... and {len(queue) - 10} more.\n"
-        else:
-            msg += "📭 **Queue is empty.**\n"
-
-        if loading_queue:
-            task_running = (
-                gid in self.loading_tasks and not self.loading_tasks[gid].done()
-            )
-            status = "currently loading" if task_running else "pending load"
-            msg += f"\n⏳ **({len(loading_queue)} track(s) {status}...)**"
-
-        await ctx.send(msg)
-
-    @commands.hybrid_command(help="Show the currently playing track.\nUsage: !np")
+    @commands.hybrid_command(help="Show the currently playing track.")
     async def np(self, ctx):
-        gid = str(ctx.guild.id)
-        current = self.current_tracks.get(gid)
-        if current:
-            duration = current.get("duration")
-            duration_str = f" ({self._format_duration(duration)})" if duration else ""
-            position = self._get_current_position(gid)
-            position_str = f" - {self._format_duration(position)}" if position else ""
-            await ctx.send(
-                f"🎵 **Now playing:** {current['title']}{duration_str}{position_str}"
-            )
-        else:
-            await ctx.send("❌ No track is currently playing.")
-
-    @commands.hybrid_command(
-        help="Show source details for the current track.\nUsage: !source"
-    )
-    async def source(self, ctx):
-        gid = str(ctx.guild.id)
-        current = self.current_tracks.get(gid)
-
+        current = self._playback(ctx).current_track
         if not current:
-            await ctx.send("❌ No track is currently playing.")
+            await ctx.send("No track is currently playing.")
             return
+        position = self._playback(ctx).position()
+        suffix = f" — {self._format_duration(position)}" if position is not None else ""
+        await ctx.send(f"Now playing: **{current.title}**{suffix}")
 
-        source_url = (
-            current.get("webpage_url")
-            or current.get("original_url")
-            or current.get("url")
-        )
-        duration = current.get("duration")
-        position = self._get_current_position(gid)
-
-        embed = discord.Embed(
-            title=current.get("title", "Unknown track"),
-            description="Source info for the current track.",
-            url=source_url if source_url else discord.Embed.Empty,
-            color=discord.Color.blurple(),
-        )
-
-        if current.get("uploader"):
-            embed.add_field(name="Channel", value=current["uploader"], inline=True)
-        if duration is not None:
-            embed.add_field(
-                name="Duration", value=self._format_duration(duration), inline=True
-            )
-        if position:
-            embed.add_field(
-                name="Position", value=self._format_duration(position), inline=True
-            )
-        if source_url:
-            embed.add_field(
-                name="Source", value=f"[Open on YouTube]({source_url})", inline=False
-            )
-        if current.get("thumbnail"):
-            embed.set_thumbnail(url=current["thumbnail"])
-
+    @commands.hybrid_command(help="Show source details for the current track.")
+    async def source(self, ctx):
+        current = self._playback(ctx).current_track
+        if not current:
+            await ctx.send("No track is currently playing.")
+            return
+        embed = discord.Embed(title=current.title, url=current.webpage_url or discord.Embed.Empty, color=discord.Color.blurple())
+        if current.uploader:
+            embed.add_field(name="Channel", value=current.uploader)
+        if current.duration is not None:
+            embed.add_field(name="Duration", value=self._format_duration(current.duration))
+        if current.thumbnail:
+            embed.set_thumbnail(url=current.thumbnail)
         await ctx.send(embed=embed)
 
-    @commands.hybrid_command(help="Skip the current track.\nUsage: !skip")
+    @commands.hybrid_command(help="Skip the current track.")
     async def skip(self, ctx):
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-            await ctx.send("⏭️ Track skipped.")
-        elif ctx.voice_client:
-            await ctx.send("❌ Nothing is currently playing to skip.")
-        else:
-            await ctx.send("❌ I'm not connected to a voice channel.")
+        outcome = await self._playback(ctx).skip()
+        await ctx.send("Track skipped." if outcome.kind == OutcomeKind.SKIPPED else outcome.detail)
 
-    @commands.hybrid_command(
-        help="Remove tracks from the queue.\nUsage: !remove <position>\nOptions:\n- Number (1-10): Remove track at position\n- 'first': Remove first track\n- 'last': Remove last track\n- 'all': Clear queue & loading queue\n- Text: Remove first matching track\nExample: !remove 3"
-    )
+    @commands.hybrid_command(help="Remove tracks from the queue.")
     async def remove(self, ctx, arg: str):
-        gid = str(ctx.guild.id)
-        queue = self.get_guild_queue(gid)
-        loading_queue = self.loading_queues.get(gid, [])
-        loading_lock = self.loading_locks.get(gid)
-
-        if not queue and not loading_queue:
-            await ctx.send("📭 The queue is empty.")
-            return
-
-        arg_lower = arg.lower()
-        removed_title = "Unknown Title"
-
-        if arg_lower == "all":
-            count = len(queue)
-            loading_count = 0
-            self.queues[gid] = []
-            if loading_lock:
-                async with loading_lock:
-                    loading_count = len(loading_queue)
-                    self.loading_queues[gid] = []
-            if gid in self.loading_tasks:
-                try:
-                    if not self.loading_tasks[gid].done():
-                        self.loading_tasks[gid].cancel()
-                        self.logger.info(
-                            f"Cancelled background loader task for GID {gid} due to !remove all."
-                        )
-                    del self.loading_tasks[gid]
-                except KeyError:
-                    pass
-                except Exception as e:
-                    self.logger.error(
-                        f"Error cancelling background task for GID {gid}: {e}"
-                    )
-
-            await ctx.send(
-                f"🗑️ Cleared the queue. Removed {count} track(s) and {loading_count} loading track(s)."
-            )
-            return
-
-        elif arg_lower == "first":
-            if queue:
-                removed = queue.pop(0)
-                removed_title = removed.get("title", removed_title)
-            else:
-                await ctx.send("📭 Queue is empty, cannot remove first.")
-                return
-        elif arg_lower == "last":
-            if queue:
-                removed = queue.pop(-1)
-                removed_title = removed.get("title", removed_title)
-            else:
-                await ctx.send("📭 Queue is empty, cannot remove last.")
-                return
+        outcome = await self._playback(ctx).remove(arg)
+        if outcome.kind == OutcomeKind.REMOVED and outcome.track:
+            await ctx.send(f"Removed track: **{outcome.track.title}**")
+        elif outcome.kind == OutcomeKind.CLEARED:
+            await ctx.send(f"Cleared the queue. Removed {outcome.detail} track(s).")
         else:
-            try:
-                index = int(arg)
-                if index < 1 or index > len(queue):
-                    await ctx.send(f"❌ Index must be between 1 and {len(queue)}.")
-                    return
-                removed = queue.pop(index - 1)
-                removed_title = removed.get("title", removed_title)
-            except ValueError:
-                search_term = arg_lower
-                found_index = -1
-                for i, track in enumerate(queue):
-                    if search_term in track.get("title", "").lower():
-                        found_index = i
-                        break
+            await ctx.send(outcome.detail)
 
-                if found_index != -1:
-                    removed = queue.pop(found_index)
-                    removed_title = removed.get("title", removed_title)
-                else:
-                    await ctx.send(
-                        "❌ No track found in the queue matching that index or title."
-                    )
-                    return
-            except IndexError:
-                await ctx.send("❌ Invalid index specified.")
-                return
-
-        await ctx.send(f"🗑️ Removed track: **{removed_title}**")
-
-    @commands.hybrid_command(
-        help="Set the music volume.\nUsage: !volume <0-150>\nExample: !volume 50\nVolume setting persists between sessions."
-    )
-    async def volume(self, ctx, vol: int = None):
-        gid = str(ctx.guild.id)
+    @commands.hybrid_command(help="Set the guild playback volume (0-150).")
+    async def volume(self, ctx, vol: Optional[int] = None):
+        playback = self._playback(ctx)
         if vol is None:
-            current_volume = int(self.volumes.get(gid, 1.0) * 100)
-            await ctx.send(
-                f"🔊 Current volume for this server is **{current_volume}%**."
-            )
+            await ctx.send(f"Current volume is **{int(await playback.volume() * 100)}%**.")
             return
-        if vol < 0 or vol > 150:
-            await ctx.send("❌ Volume must be between 0 and 150.")
-            return
+        outcome = await playback.set_volume(vol / 100)
+        await ctx.send(f"Volume set to **{vol}%**." if outcome.kind == OutcomeKind.VOLUME_CHANGED else f"Unable to set volume: {outcome.detail}")
 
-        target_volume = vol / 100.0
-        self.volumes[gid] = target_volume
-
-        try:
-            with open(self.volumes_file, "w") as f:
-                json.dump(self.volumes, f, indent=4)
-        except Exception as e:
-            self.logger.error(f"Failed to save volumes to {self.volumes_file}: {e}")
-
-        if (
-            ctx.voice_client
-            and ctx.voice_client.source
-            and isinstance(ctx.voice_client.source, discord.PCMVolumeTransformer)
-        ):
-            ctx.voice_client.source.volume = target_volume
-        await ctx.send(f"🔊 Volume set to **{vol}%** for this server.")
-
-    @commands.hybrid_command(help="Stop playback and disconnect the bot.\nUsage: !stop")
+    @commands.hybrid_command(help="Stop playback and disconnect the bot.")
     async def stop(self, ctx):
-        gid = str(ctx.guild.id)
-        if gid in self.loading_tasks:
-            try:
-                if not self.loading_tasks[gid].done():
-                    self.loading_tasks[gid].cancel()
-                    self.logger.info(
-                        f"Cancelled background loader task for GID {gid} due to !stop."
-                    )
-                del self.loading_tasks[gid]
-            except KeyError:
-                pass
-            except Exception as e:
-                self.logger.error(
-                    f"Error cancelling background task during stop for GID {gid}: {e}"
-                )
+        guild_id = str(ctx.guild.id)
+        playback = self.playbacks.pop(guild_id, None)
+        self.outcomes.pop(guild_id, None)
+        if not playback:
+            await ctx.send("Nothing is playing.")
+            return
+        await playback.close()
+        await ctx.send("Stopped playback and disconnected.")
 
-        if gid in self.queues:
-            self.queues[gid] = []
-        if gid in self.loading_locks:
-            try:
-                if gid in self.loading_queues:
-                    self.loading_queues[gid] = []
-            except Exception as e:
-                self.logger.error(
-                    f"Error clearing loading queue during stop for GID {gid}: {e}"
-                )
-
-        if gid in self.current_tracks:
-            self.current_tracks[gid] = None
-
-        if ctx.voice_client:
-            try:
-                await ctx.voice_client.disconnect()
-                await ctx.send("⏹️ Stopped playback and disconnected.")
-            except Exception as e:
-                await ctx.send(f"❌ Error disconnecting: {e}")
-                self.logger.error(f"Error disconnecting GID {gid}: {e}")
-        else:
-            await ctx.send(
-                "⏹️ I'm not connected to a voice channel, but queues have been cleared."
-            )
-
-    @commands.hybrid_command(help="Pause the current track.\nUsage: !pause")
+    @commands.hybrid_command(help="Pause playback.")
     async def pause(self, ctx):
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.pause()
-            gid = str(ctx.guild.id)
-            loop = self.bot.loop
-            self.pause_start_time[gid] = loop.time()
-            await ctx.send("⏸️ Music has been paused.")
-        elif ctx.voice_client and ctx.voice_client.is_paused():
-            await ctx.send("⏸️ Music is already paused.")
-        else:
-            await ctx.send("❌ No music is currently playing.")
+        outcome = await self._playback(ctx).pause()
+        await ctx.send("Music paused." if outcome.kind == OutcomeKind.PAUSED else outcome.detail)
 
-    @commands.hybrid_command(help="Resume the paused track.\nUsage: !resume")
+    @commands.hybrid_command(help="Resume playback.")
     async def resume(self, ctx):
-        if ctx.voice_client and ctx.voice_client.is_paused():
-            ctx.voice_client.resume()
-            gid = str(ctx.guild.id)
-            loop = self.bot.loop
-            pause_start = self.pause_start_time.pop(gid, None)
-            if pause_start and gid in self.playback_start_time:
-                pause_duration = loop.time() - pause_start
-                self.playback_start_time[gid] += pause_duration
-                self.logger.debug(
-                    f"Resumed GID {gid}. Adjusted start time by {pause_duration:.2f}s."
-                )
-            elif pause_start:
-                self.logger.warning(
-                    f"Resumed GID {gid} but playback_start_time was missing."
-                )
-            await ctx.send("▶️ Music has been resumed.")
-        elif ctx.voice_client and ctx.voice_client.is_playing():
-            await ctx.send("▶️ Music is already playing.")
-        else:
-            await ctx.send("❌ Music is not paused or playing.")
+        outcome = await self._playback(ctx).resume()
+        await ctx.send("Music resumed." if outcome.kind == OutcomeKind.RESUMED else outcome.detail)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if not self.bot.user or member.id != self.bot.user.id or not before.channel or after.channel:
+            return
+        guild_id = str(member.guild.id)
+        playback = self.playbacks.pop(guild_id, None)
+        self.outcomes.pop(guild_id, None)
+        if playback:
+            await playback.close(disconnect=False)
+
+    def cog_unload(self):
+        for playback in self.playbacks.values():
+            self.bot.loop.create_task(playback.close())
 
 
 async def setup(bot):
     await bot.add_cog(MusicCommands(bot))
-

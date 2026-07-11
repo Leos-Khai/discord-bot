@@ -56,6 +56,7 @@ class DatabaseService:
         self.channel_links = self.db.channel_links
         self.custom_messages = self.db.custom_messages
         self.music_channel_limits = self.db.music_channel_limits
+        self.guild_playback_settings = self.db.guild_playback_settings
         self.notification_channels = self.db.notification_channels
         self.youtube_subscriptions = self.db.youtube_subscriptions
         self.notified_videos = self.db.notified_videos
@@ -71,6 +72,7 @@ class DatabaseService:
             [("guild_id", 1), ("type", 1)], unique=True
         )
         await self.music_channel_limits.create_index("guild_id", unique=True)
+        await self.guild_playback_settings.create_index("guild_id", unique=True)
         await self.notification_channels.create_index("guild_id", unique=True)
         await self.youtube_subscriptions.create_index(
             [("guild_id", 1), ("youtube_channel_id", 1)], unique=True
@@ -256,6 +258,24 @@ class DatabaseService:
     async def clear_music_channels(self, guild_id: str) -> List[str]:
         await self.music_channel_limits.delete_one({"guild_id": guild_id})
         return []
+
+    # ---- Guild Playback ------------------------------------------------ #
+    async def get_playback_volume(self, guild_id: str) -> float:
+        doc = await self.guild_playback_settings.find_one(
+            {"guild_id": guild_id}, {"_id": 0, "volume": 1}
+        )
+        return float(doc.get("volume", 1.0)) if doc else 1.0
+
+    async def set_playback_volume(self, guild_id: str, volume: float) -> None:
+        now = datetime.utcnow()
+        await self.guild_playback_settings.update_one(
+            {"guild_id": guild_id},
+            {
+                "$set": {"volume": volume, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
 
     # ---- Notifications (YouTube + Twitch) ------------------------------ #
     async def set_notification_channel(self, guild_id: str, channel_id: str) -> None:
@@ -528,6 +548,14 @@ async def remove_music_channel(guild_id, channel_id):
 
 async def clear_music_channels(guild_id):
     return await _db_service.clear_music_channels(guild_id)
+
+
+async def get_playback_volume(guild_id: str):
+    return await _db_service.get_playback_volume(guild_id)
+
+
+async def set_playback_volume(guild_id: str, volume: float):
+    return await _db_service.set_playback_volume(guild_id, volume)
 
 
 # Notifications
