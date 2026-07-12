@@ -33,13 +33,6 @@ FFMPEG_OPTIONS = {
 }
 
 
-class ErrorForwardingPCMVolumeTransformer(discord.PCMVolumeTransformer):
-    @property
-    def _current_error(self):
-        # discord.py's AudioPlayer inspects only its outer source for this error.
-        return getattr(self.original, "_current_error", None)
-
-
 class YtdlpMediaAdapter:
     def __init__(self, logger):
         self.logger = logger
@@ -120,56 +113,6 @@ class YtdlpMediaAdapter:
         ]
 
 
-class DiscordVoiceAdapter:
-    def __init__(self, guild: discord.Guild):
-        self.guild = guild
-
-    async def ensure_connected(self, channel: discord.VoiceChannel) -> None:
-        client = self.guild.voice_client
-        if client is None:
-            await channel.connect()
-        elif client.channel != channel:
-            await client.move_to(channel)
-
-    async def play(self, track: Track, volume: float, after) -> None:
-        client = self.guild.voice_client
-        if not client or not client.is_connected():
-            raise RuntimeError("Voice client unavailable for playback")
-        source = ErrorForwardingPCMVolumeTransformer(
-            discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS), volume=volume
-        )
-        client.play(source, after=after)
-
-    def is_playing(self) -> bool:
-        return bool(self.guild.voice_client and self.guild.voice_client.is_playing())
-
-    def is_paused(self) -> bool:
-        return bool(self.guild.voice_client and self.guild.voice_client.is_paused())
-
-    def pause(self) -> None:
-        if self.guild.voice_client:
-            self.guild.voice_client.pause()
-
-    def resume(self) -> None:
-        if self.guild.voice_client:
-            self.guild.voice_client.resume()
-
-    def stop(self) -> None:
-        if self.guild.voice_client:
-            self.guild.voice_client.stop()
-
-    async def disconnect(self) -> None:
-        if self.guild.voice_client:
-            await self.guild.voice_client.disconnect()
-
-    def set_volume(self, value: float) -> None:
-        source = self.guild.voice_client.source if self.guild.voice_client else None
-        if isinstance(source, discord.PCMVolumeTransformer):
-            source.volume = value
-        elif source and hasattr(source, "set_music_volume"):
-            source.set_music_volume(value)
-
-
 class MongoVolumeAdapter:
     async def load(self, guild_id: str) -> float:
         return await get_playback_volume(guild_id)
@@ -235,14 +178,16 @@ class MusicCommands(commands.Cog):
         publisher = self.outcomes.setdefault(guild_id, DiscordOutcomeAdapter())
         publisher.use_channel(ctx.channel)
         if guild_id not in self.playbacks:
+            audio = self.bot.guild_audio.for_guild(ctx.guild)
             self.playbacks[guild_id] = GuildPlayback(
                 guild_id,
-                DiscordVoiceAdapter(ctx.guild),
+                audio,
                 self.media,
                 MongoVolumeAdapter(),
                 publisher,
                 self.logger,
             )
+            audio.register_queued_playback_starter(self.playbacks[guild_id].start_queued_if_idle)
         return self.playbacks[guild_id]
 
     async def start_queued_if_idle(self, guild_id: str) -> None:
@@ -413,12 +358,13 @@ class MusicCommands(commands.Cog):
         if not playback:
             client = ctx.guild.voice_client
             if client and client.is_connected():
-                await client.disconnect()
+                await self.bot.guild_audio.discard(guild_id)
                 await ctx.send("Disconnected.")
             else:
                 await ctx.send("Nothing is playing.")
             return
         await playback.close()
+        await self.bot.guild_audio.discard(guild_id)
         await ctx.send("Stopped playback and disconnected.")
 
     @commands.hybrid_command(help="Pause playback.")
@@ -440,10 +386,12 @@ class MusicCommands(commands.Cog):
         self.outcomes.pop(guild_id, None)
         if playback:
             await playback.close(disconnect=False)
+        await self.bot.guild_audio.discard(guild_id)
 
     def cog_unload(self):
-        for playback in self.playbacks.values():
+        for guild_id, playback in self.playbacks.items():
             self.bot.loop.create_task(playback.close())
+            self.bot.loop.create_task(self.bot.guild_audio.discard(guild_id))
 
 
 async def setup(bot):

@@ -5,6 +5,7 @@ import os
 import asyncio
 from dotenv import load_dotenv
 from db import initialize_database
+from guild_audio import GuildAudioRegistry
 from logger import get_logger
 
 # Load environment variables
@@ -49,6 +50,7 @@ class CustomBot(commands.AutoShardedBot):
 
 
 bot = CustomBot(command_prefix=config["prefix"], intents=discord.Intents.all())
+bot.guild_audio = GuildAudioRegistry(get_logger())
 
 logger = get_logger()
 
