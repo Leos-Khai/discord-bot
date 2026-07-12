@@ -16,6 +16,10 @@ _Avoid_: voice client ownership, music/TTS coordination
 The saved loudness preference applied to a guild's Guild Playback.
 _Avoid_: volume file, music volume
 
+**Guild Command-Channel Access**:
+The explicit text channels in one guild where every Guild Playback and spoken-message command is available. Until at least one channel is configured, neither command family is available.
+_Avoid_: music channel limits, allowed channel cache
+
 **Twitch Notification Delivery**:
 The attempt to notify one guild that a particular Twitch stream has gone live or offline. It is pending until delivered, or abandoned for that transition after its retry limit is exhausted; a later stream or transition is a new delivery.
 _Avoid_: stream status, notification retry

@@ -7,7 +7,8 @@ import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
-from db import get_music_channels, get_playback_volume, set_playback_volume
+from db import get_playback_volume, set_playback_volume
+from guild_command_access import GuildCommandChannelAccess
 from guild_playback import GuildPlayback, OutcomeKind, PlaybackOutcome, Track, TrackRequest
 from logger import get_logger
 
@@ -146,25 +147,17 @@ class MusicCommands(commands.Cog):
         self.bot = bot
         self.logger = get_logger()
         self.media = YtdlpMediaAdapter(self.logger)
+        self.command_access: GuildCommandChannelAccess = bot.guild_command_access
         self.playbacks: dict[str, GuildPlayback] = {}
         self.outcomes: dict[str, DiscordOutcomeAdapter] = {}
-        self.allowed_channels_cache: dict[str, set[int]] = {}
-
-    async def _get_allowed_channels(self, guild_id: str) -> set[int]:
-        if guild_id not in self.allowed_channels_cache:
-            self.allowed_channels_cache[guild_id] = {int(channel) for channel in await get_music_channels(guild_id)}
-        return self.allowed_channels_cache[guild_id]
-
-    async def refresh_allowed_channels_cache(self, guild_id: str):
-        self.allowed_channels_cache.pop(guild_id, None)
-        await self._get_allowed_channels(guild_id)
 
     async def cog_check(self, ctx):
-        if not ctx.guild:
-            return False
-        allowed = await self._get_allowed_channels(str(ctx.guild.id))
-        if allowed and ctx.channel.id not in allowed:
-            await ctx.send("Music commands are limited to: " + ", ".join(f"<#{channel}>" for channel in allowed))
+        decision = await self.command_access.evaluate(
+            str(ctx.guild.id) if ctx.guild else None,
+            str(ctx.channel.id) if ctx.channel else None,
+        )
+        if not decision.allowed:
+            await ctx.send(decision.detail)
             return False
         return True
 

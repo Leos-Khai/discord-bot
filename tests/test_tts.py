@@ -1,10 +1,10 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
+from guild_command_access import GuildCommandChannelAccess
 from tts import DEFAULT_TTS_VOICE, TtsPreferences, TtsQueue
 
 
@@ -17,6 +17,11 @@ class FakePreferencesStore:
 
     async def set_tts_voice(self, guild_id, user_id, voice):
         self.values[(guild_id, user_id)] = voice
+
+
+class FakeCommandChannelStore:
+    async def get_command_channels(self, guild_id):
+        return []
 
 
 class TtsPreferencesTests(unittest.IsolatedAsyncioTestCase):
@@ -114,12 +119,17 @@ class TtsCommandChecksTests(unittest.IsolatedAsyncioTestCase):
         from cogs.tts import TtsCommands
 
         cog = object.__new__(TtsCommands)
+        cog.command_access = GuildCommandChannelAccess(FakeCommandChannelStore())
         interaction = FakeInteraction()
-        with patch("cogs.tts.get_music_channels", new=AsyncMock(return_value=[])):
-            allowed = await cog.interaction_check(interaction)
+        allowed = await cog.interaction_check(interaction)
 
         self.assertFalse(allowed)
         self.assertEqual(
-            [("An admin must configure a music command channel before TTS can be used.", True)],
+            [
+                (
+                    "An administrator must configure command channels before Music or TTS can be used.",
+                    True,
+                )
+            ],
             interaction.response.messages,
         )

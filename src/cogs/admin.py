@@ -9,11 +9,8 @@ from db import (
     update_channel_link_role,
     update_channel_link_text,
     set_custom_message,
-    get_music_channels,
-    add_music_channel,
-    remove_music_channel,
-    clear_music_channels,
 )
+from guild_command_access import GuildCommandChannelAccess
 
 
 def is_admin():
@@ -28,11 +25,7 @@ def is_admin():
 class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-
-    async def _refresh_music_cog_limits(self, guild_id: str):
-        music_cog = self.bot.get_cog("MusicCommands")
-        if music_cog and hasattr(music_cog, "refresh_allowed_channels_cache"):
-            await music_cog.refresh_allowed_channels_cache(guild_id)
+        self.command_access: GuildCommandChannelAccess = bot.guild_command_access
 
     @commands.command(help="Lists all active channel links in the current server.")
     @is_admin()
@@ -281,33 +274,30 @@ Example: !set_message reset all (Resets all messages to default)
     @commands.group(
         name="music_channels",
         invoke_without_command=True,
-        help="List or manage which text channels can run music commands.\nUsage: !music_channels (lists), !music_channels add #channel, !music_channels remove #channel, !music_channels clear",
+        help="List or manage which text channels can run Music and TTS commands.\nUsage: !music_channels (lists), !music_channels add #channel, !music_channels remove #channel, !music_channels clear",
     )
     @is_admin()
     async def music_channels(self, ctx):
         guild_id = str(ctx.guild.id)
-        allowed = await get_music_channels(guild_id)
+        allowed = await self.command_access.configured_channels(guild_id)
         if not allowed:
-            await ctx.send("No limits set. Music commands can run in any channel.")
+            await ctx.send("No command channels are configured. Music and TTS are disabled.")
             return
         mentions = ", ".join(f"<#{cid}>" for cid in allowed)
-        await ctx.send(f"Music commands are limited to: {mentions}")
+        await ctx.send(f"Music and TTS commands are limited to: {mentions}")
 
     @music_channels.command(
         name="add",
-        help="Allow one or more text channels to run music commands.\nUsage: !music_channels add #music [#dj ...]",
+        help="Allow one or more text channels to run Music and TTS commands.\nUsage: !music_channels add #music [#dj ...]",
     )
     async def music_channels_add(self, ctx, *channels: discord.TextChannel):
         if not channels:
             await ctx.send("Please mention at least one text channel to allow.")
             return
 
-        guild_id = str(ctx.guild.id)
-        for channel in channels:
-            await add_music_channel(guild_id, str(channel.id))
-
-        await self._refresh_music_cog_limits(guild_id)
-        updated = await get_music_channels(guild_id)
+        updated = await self.command_access.allow(
+            str(ctx.guild.id), [str(channel.id) for channel in channels]
+        )
         mentions = ", ".join(f"<#{cid}>" for cid in updated)
         await ctx.send(f"Updated allowed channels: {mentions}")
 
@@ -320,15 +310,12 @@ Example: !set_message reset all (Resets all messages to default)
             await ctx.send("Please mention at least one text channel to remove.")
             return
 
-        guild_id = str(ctx.guild.id)
-        for channel in channels:
-            await remove_music_channel(guild_id, str(channel.id))
-
-        await self._refresh_music_cog_limits(guild_id)
-        updated = await get_music_channels(guild_id)
+        updated = await self.command_access.remove(
+            str(ctx.guild.id), [str(channel.id) for channel in channels]
+        )
         if not updated:
             await ctx.send(
-                "Removed those channels. No limits remain; music commands can run anywhere."
+                "Removed those channels. Music and TTS are disabled until a channel is added."
             )
             return
         mentions = ", ".join(f"<#{cid}>" for cid in updated)
@@ -336,13 +323,11 @@ Example: !set_message reset all (Resets all messages to default)
 
     @music_channels.command(
         name="clear",
-        help="Remove all channel limits for music commands.\nUsage: !music_channels clear",
+        help="Disable Music and TTS commands until a channel is added.\nUsage: !music_channels clear",
     )
     async def music_channels_clear(self, ctx):
-        guild_id = str(ctx.guild.id)
-        await clear_music_channels(guild_id)
-        await self._refresh_music_cog_limits(guild_id)
-        await ctx.send("Cleared limits. Music commands can run in any channel.")
+        await self.command_access.clear(str(ctx.guild.id))
+        await ctx.send("Cleared command channels. Music and TTS are disabled until a channel is added.")
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx, error):

@@ -4,8 +4,9 @@ import json
 import os
 import asyncio
 from dotenv import load_dotenv
-from db import initialize_database
+from db import get_database_service, initialize_database
 from guild_audio import GuildAudioRegistry
+from guild_command_access import GuildCommandChannelAccess, MongoCommandChannelStore
 from logger import get_logger
 
 # Load environment variables
@@ -51,6 +52,9 @@ class CustomBot(commands.AutoShardedBot):
 
 bot = CustomBot(command_prefix=config["prefix"], intents=discord.Intents.all())
 bot.guild_audio = GuildAudioRegistry(get_logger())
+bot.guild_command_access = GuildCommandChannelAccess(
+    MongoCommandChannelStore(get_database_service())
+)
 
 logger = get_logger()
 

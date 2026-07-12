@@ -8,7 +8,8 @@ import discord
 from discord.ext import commands
 import edge_tts
 
-from db import get_database_service, get_music_channels
+from db import get_database_service
+from guild_command_access import GuildCommandChannelAccess
 from logger import get_logger
 from tts import TtsPreferences
 
@@ -63,39 +64,34 @@ class TtsCommands(commands.Cog):
         self.bot = bot
         self.logger = get_logger()
         self.preferences = TtsPreferences(get_database_service())
+        self.command_access: GuildCommandChannelAccess = bot.guild_command_access
         self.synthesizer = EdgeTtsVoiceCatalog()
         self._voice_cache: list[dict] = []
         self._voices_cached_at = 0.0
         self._voice_lock = asyncio.Lock()
 
     async def cog_check(self, ctx):
-        message = await self._channel_error(ctx.guild, ctx.channel.id)
-        if message:
-            await ctx.send(message)
+        decision = await self.command_access.evaluate(
+            str(ctx.guild.id) if ctx.guild else None,
+            str(ctx.channel.id) if ctx.channel else None,
+        )
+        if not decision.allowed:
+            await ctx.send(decision.detail)
             return False
         return True
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        message = await self._channel_error(interaction.guild, interaction.channel_id)
-        if not message:
+        decision = await self.command_access.evaluate(
+            str(interaction.guild.id) if interaction.guild else None,
+            str(interaction.channel_id) if interaction.channel_id else None,
+        )
+        if decision.allowed:
             return True
         if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+            await interaction.followup.send(decision.detail, ephemeral=True)
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(decision.detail, ephemeral=True)
         return False
-
-    async def _channel_error(
-        self, guild: Optional[discord.Guild], channel_id: Optional[int]
-    ) -> Optional[str]:
-        if not guild:
-            return "TTS commands are only available in a server."
-        allowed = [int(channel) for channel in await get_music_channels(str(guild.id))]
-        if not allowed:
-            return "An admin must configure a music command channel before TTS can be used."
-        if channel_id not in allowed:
-            return "TTS commands are limited to: " + ", ".join(f"<#{channel}>" for channel in allowed)
-        return None
 
     async def cog_command_error(self, ctx, error):
         if isinstance(error, commands.CheckFailure):
