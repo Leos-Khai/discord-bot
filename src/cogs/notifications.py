@@ -7,6 +7,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
+from command_help import describe_parameters
 from cogs.admin import is_admin
 from db import (
     add_twitch_subscription,
@@ -693,6 +694,7 @@ class Notifications(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
+    @describe_parameters(channel="Text channel that receives notifications by default.")
     @notifications.command(
         name="channel",
         help="Set the default notification channel.\nUsage: !notifications channel #text-channel",
@@ -711,6 +713,10 @@ class Notifications(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
+    @describe_parameters(
+        channel_id="YouTube channel ID, channel URL, or @handle to track.",
+        channel="Optional text channel for this subscription; otherwise use the default.",
+    )
     @youtube.command(
         name="add",
         help="Add a YouTube channel.\nUsage: !notifications youtube add <channel_id|url|@handle> [#target-channel]",
@@ -753,6 +759,7 @@ class Notifications(commands.Cog):
         except Exception as e:
             await ctx.send(str(e))
 
+    @describe_parameters(channel_id="YouTube channel ID to stop tracking.")
     @youtube.command(name="remove", help="Remove a YouTube channel from tracking.")
     @is_admin()
     async def youtube_remove(self, ctx, channel_id: str):
@@ -787,6 +794,10 @@ class Notifications(commands.Cog):
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
+    @describe_parameters(
+        username="Twitch username or twitch.tv profile URL to track.",
+        channel="Optional text channel for this subscription; otherwise use the default.",
+    )
     @twitch.command(
         name="add",
         help="Add a Twitch streamer.\nUsage: !notifications twitch add <username|url> [#target-channel]",
@@ -847,6 +858,7 @@ class Notifications(commands.Cog):
         except Exception as e:
             await ctx.send(str(e))
 
+    @describe_parameters(username="Twitch username to stop tracking.")
     @twitch.command(name="remove", help="Remove a Twitch streamer from tracking.")
     @is_admin()
     async def twitch_remove(self, ctx, username: str):

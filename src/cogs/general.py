@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from command_help import describe_parameters
 from cogs.admin import is_admin
 
 
@@ -12,6 +13,11 @@ class General(commands.Cog):
     async def ping(self, ctx):
         await ctx.send(f"Pong! {round(self.bot.latency * 1000)}ms")
 
+    @describe_parameters(
+        num1="First number in the calculation.",
+        operator="Arithmetic operator: +, -, *, or /.",
+        num2="Second number in the calculation.",
+    )
     @commands.command(
         help="Performs basic arithmetic calculations.\nUsage: !calculate number operator number\nOperators: + - * /\nExample: !calculate 10 * 5"
     )

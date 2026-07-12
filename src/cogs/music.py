@@ -4,9 +4,11 @@ import re
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
+from command_help import describe_parameters
 from db import get_playback_volume, set_playback_volume
 from guild_command_access import GuildCommandChannelAccess
 from guild_playback import GuildPlayback, OutcomeKind, PlaybackOutcome, Track, TrackRequest
@@ -217,7 +219,9 @@ class MusicCommands(commands.Cog):
             await self._playback(ctx).join(channel)
             await ctx.send(f"Connected to **{channel.name}**.")
 
+    @describe_parameters(query="YouTube URL, playlist URL, or search terms.")
     @commands.hybrid_command(help="Play a YouTube URL, playlist, or search query.")
+    @app_commands.describe(query="YouTube URL, playlist URL, or search terms.")
     async def play(self, ctx, *, query: str):
         if not query:
             await ctx.send("Please provide a URL or search terms to play.")
@@ -237,7 +241,9 @@ class MusicCommands(commands.Cog):
         )
         await self._send_enqueue_outcome(ctx, outcome)
 
+    @describe_parameters(query="Words to search for on YouTube.")
     @commands.hybrid_command(help="Search YouTube and choose a result.")
+    @app_commands.describe(query="Words to search for on YouTube.")
     async def search(self, ctx, *, query: str):
         channel = await self._voice_channel(ctx)
         if not channel:
@@ -324,7 +330,9 @@ class MusicCommands(commands.Cog):
         outcome = await self._playback(ctx).skip()
         await ctx.send("Track skipped." if outcome.kind == OutcomeKind.SKIPPED else outcome.detail)
 
+    @describe_parameters(arg="Track number to remove, or clear to empty the queue.")
     @commands.hybrid_command(help="Remove tracks from the queue.")
+    @app_commands.describe(arg="Track number to remove, or clear to empty the queue.")
     async def remove(self, ctx, arg: str):
         outcome = await self._playback(ctx).remove(arg)
         if outcome.kind == OutcomeKind.REMOVED and outcome.track:
@@ -334,7 +342,9 @@ class MusicCommands(commands.Cog):
         else:
             await ctx.send(outcome.detail)
 
+    @describe_parameters(vol="Volume percentage from 0 to 150; omit to view the current volume.")
     @commands.hybrid_command(help="Set the guild playback volume (0-150).")
+    @app_commands.describe(vol="Volume percentage from 0 to 150; omit to view the current volume.")
     async def volume(self, ctx, vol: Optional[int] = None):
         playback = self._playback(ctx)
         if vol is None:

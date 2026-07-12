@@ -5,9 +5,11 @@ import time
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import edge_tts
 
+from command_help import describe_parameters
 from db import get_database_service
 from guild_command_access import GuildCommandChannelAccess
 from logger import get_logger
@@ -133,7 +135,9 @@ class TtsCommands(commands.Cog):
     def _audio(self, guild: discord.Guild):
         return self.bot.guild_audio.for_guild(guild)
 
+    @describe_parameters(message="Text for the bot to speak in your voice channel.")
     @commands.hybrid_command(name="tts", help="Speak a message in your voice channel.")
+    @app_commands.describe(message="Text for the bot to speak in your voice channel.")
     async def tts(self, ctx, *, message: str):
         if not await self._ensure_voice_channel(ctx):
             return
@@ -152,7 +156,9 @@ class TtsCommands(commands.Cog):
         else:
             await ctx.send("Speaking your message.")
 
+    @describe_parameters(voice="Exact voice ID shown by the listvoice command.")
     @commands.hybrid_command(name="setttsvoice", help="Set your TTS voice for this server.")
+    @app_commands.describe(voice="Exact voice ID shown by the listvoice command.")
     async def setttsvoice(self, ctx, *, voice: str):
         try:
             voices = await self._voices()
@@ -170,7 +176,9 @@ class TtsCommands(commands.Cog):
         await self.preferences.set_voice(str(ctx.guild.id), str(ctx.author.id), selected)
         await ctx.send(f"Your TTS voice for this server is now `{selected}`.")
 
+    @describe_parameters(language="Optional language or locale filter, such as en or en-GB.")
     @commands.hybrid_command(name="listvoice", help="List voices available for TTS.")
+    @app_commands.describe(language="Optional language or locale filter, such as en or en-GB.")
     async def listvoice(self, ctx, language: Optional[str] = None):
         try:
             voices = await self._voices()

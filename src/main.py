@@ -4,6 +4,7 @@ import json
 import os
 import asyncio
 from dotenv import load_dotenv
+from command_help import HelpfulHelpCommand
 from db import get_database_service, initialize_database
 from guild_audio import GuildAudioRegistry
 from guild_command_access import GuildCommandChannelAccess, MongoCommandChannelStore
@@ -50,7 +51,11 @@ class CustomBot(commands.AutoShardedBot):
         pass  # Override to disable default command logging
 
 
-bot = CustomBot(command_prefix=config["prefix"], intents=discord.Intents.all())
+bot = CustomBot(
+    command_prefix=config["prefix"],
+    intents=discord.Intents.all(),
+    help_command=HelpfulHelpCommand(),
+)
 bot.guild_audio = GuildAudioRegistry(get_logger())
 bot.guild_command_access = GuildCommandChannelAccess(
     MongoCommandChannelStore(get_database_service())

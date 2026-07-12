@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from command_help import describe_parameters
 from db import (
     get_channel_links_by_guild,
     get_servers,
@@ -54,6 +55,11 @@ class Admin(commands.Cog):
 
         await ctx.send(description)
 
+    @describe_parameters(
+        text_channel="Text channel where announcements will be sent.",
+        voice_channel_name="Exact name of the voice channel to link.",
+        role="Optional role to mention in each announcement.",
+    )
     @commands.command(
         help='Links a text channel to a voice channel with an optional role.\nUsage: !link_channel #text-channel "Voice Channel Name" @role\nExample: !link_channel #general "Gaming Voice" @Members'
     )
@@ -147,6 +153,10 @@ class Admin(commands.Cog):
             if isinstance(e.original, discord.errors.TimeoutError):
                 await ctx.send("You took too long to respond.")
 
+    @describe_parameters(
+        voice_channel_name="Exact name of the linked voice channel.",
+        new_text_channel="Text channel that should receive announcements.",
+    )
     @commands.command(
         help='Updates the text channel for an existing voice channel link.\nUsage: !update_channel "Voice Channel Name" #new-text-channel\nExample: !update_channel "Gaming Voice" #gaming-chat'
     )
@@ -172,6 +182,10 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
+    @describe_parameters(
+        voice_channel_name="Exact name of the linked voice channel.",
+        new_role="Optional role to mention in each announcement.",
+    )
     @commands.command(
         help='Updates the role for an existing voice channel link.\nUsage: !update_role "Voice Channel Name" @new-role\nExample: !update_role "Gaming Voice" @Gamers'
     )
@@ -197,6 +211,9 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
+    @describe_parameters(
+        voice_channel_name="Exact name of the linked voice channel.",
+    )
     @commands.command(
         help='Removes the role from an existing voice channel link.\nUsage: !remove_role "Voice Channel Name"\nExample: !remove_role "Gaming Voice"'
     )
@@ -217,6 +234,10 @@ class Admin(commands.Cog):
         else:
             await ctx.send("No link found for the specified voice channel.")
 
+    @describe_parameters(
+        msg_type="Announcement type: join, leave, move, or reset.",
+        message="Message template, or the template type to reset.",
+    )
     @commands.command(
         help="""Sets a custom notification message for voice channel events.
 Available message types: join, leave, move
@@ -286,6 +307,9 @@ Example: !set_message reset all (Resets all messages to default)
         mentions = ", ".join(f"<#{cid}>" for cid in allowed)
         await ctx.send(f"Music and TTS commands are limited to: {mentions}")
 
+    @describe_parameters(
+        channels="One or more text channels where Music and TTS commands are allowed.",
+    )
     @music_channels.command(
         name="add",
         help="Allow one or more text channels to run Music and TTS commands.\nUsage: !music_channels add #music [#dj ...]",
@@ -301,6 +325,9 @@ Example: !set_message reset all (Resets all messages to default)
         mentions = ", ".join(f"<#{cid}>" for cid in updated)
         await ctx.send(f"Updated allowed channels: {mentions}")
 
+    @describe_parameters(
+        channels="One or more text channels to remove from command access.",
+    )
     @music_channels.command(
         name="remove",
         help="Remove one or more text channels from the allowed list.\nUsage: !music_channels remove #music [#dj ...]",
