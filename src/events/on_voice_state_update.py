@@ -1,234 +1,80 @@
 import discord
 from discord.ext import commands
-from db import get_channel_link, get_custom_message
+
+from db import get_database_service
+from guild_voice_announcements import (
+    GuildVoiceAnnouncements,
+    VoiceAnnouncementTarget,
+    VoiceChannel,
+    VoiceChannelLink,
+    VoiceMember,
+    VoiceStateTransition,
+)
 
 
-def replace_tokens(
-    message, member, channel=None, old_channel=None, new_channel=None, role=None
-):
-    """Replace message tokens with actual values."""
-    if not message:
-        # Default messages if none is set
-        if old_channel and new_channel:
-            message = f"{member.display_name}({member.name}) moved from {old_channel.name} to {new_channel.name}"
-        elif channel:
-            if old_channel:  # Leave message
-                message = (
-                    f"{member.display_name}({member.name}) has left {channel.name}"
-                )
-            else:  # Join message
-                message = (
-                    f"{member.display_name}({member.name}) has joined {channel.name}"
-                )
+class MongoVoiceAnnouncementStore:
+    """Database adapter for Guild Voice Announcements."""
 
-    # Append role mention if a role exists
-    if role:
-        message = f"{role.mention} {message}"
+    def __init__(self, database):
+        self._database = database
 
-    replacements = {
-        "$USERNAME": member.name,
-        "$USER": member.display_name,
-        "$NICKNAME": member.nick or member.display_name,
-        "$MENTION": member.mention,
-        "$CHANNEL": channel.name if channel else "",
-        "$OLD_CHANNEL": old_channel.name if old_channel else "",
-        "$NEW_CHANNEL": new_channel.name if new_channel else "",
-    }
+    async def channel_link(self, voice_channel_id: str):
+        link = await self._database.get_channel_link(voice_channel_id)
+        if not link:
+            return None
+        return VoiceChannelLink(*link)
 
-    for token, value in replacements.items():
-        if message:
-            message = message.replace(token, value)
+    async def custom_message(self, guild_id: str, announcement_type: str):
+        return await self._database.get_custom_message(guild_id, announcement_type)
 
-    return message
+
+class DiscordVoiceAnnouncementPublisher:
+    """Discord adapter for Guild Voice Announcements."""
+
+    def __init__(self, bot):
+        self._bot = bot
+
+    async def target_for(self, link: VoiceChannelLink):
+        guild = discord.utils.get(self._bot.guilds, id=int(link.guild_id))
+        if not guild:
+            return None
+        text_channel = discord.utils.get(guild.text_channels, id=int(link.text_channel_id))
+        if not text_channel:
+            return None
+        role = discord.utils.get(guild.roles, id=int(link.role_id)) if link.role_id else None
+        return VoiceAnnouncementTarget(text_channel, role.mention if role else None)
+
+    async def publish(self, target, message: str) -> None:
+        await target.channel.send(message)
 
 
 class OnVoiceStateUpdate(commands.Cog):
     def __init__(self, bot):
-        self.bot = bot
+        self.announcements = GuildVoiceAnnouncements(
+            MongoVoiceAnnouncementStore(get_database_service()),
+            DiscordVoiceAnnouncementPublisher(bot),
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         if member.bot:
             return
+        await self.announcements.announce(
+            VoiceStateTransition(
+                VoiceMember(
+                    member.name,
+                    member.display_name,
+                    member.nick,
+                    member.mention,
+                ),
+                self._channel(before.channel),
+                self._channel(after.channel),
+            )
+        )
 
-        # Helper function to get guild, text channel, and role
-        def get_guild_entities(guild_id, text_channel_id, role_id=None):
-            guild = discord.utils.get(self.bot.guilds, id=int(guild_id))
-            if guild:
-                text_channel = discord.utils.get(
-                    guild.text_channels, id=int(text_channel_id)
-                )
-                role = (
-                    discord.utils.get(guild.roles, id=int(role_id)) if role_id else None
-                )
-                return guild, text_channel, role
-            return None, None, None
-
-        # Handle transitions between channels
-        if before.channel and after.channel and before.channel != after.channel:
-            before_channel_id = str(before.channel.id)
-            after_channel_id = str(after.channel.id)
-
-            before_channel_link = await get_channel_link(before_channel_id)
-            after_channel_link = await get_channel_link(after_channel_id)
-
-            if not before_channel_link and after_channel_link:
-                # Transitioning from a non-database channel to a database channel
-                guild_id, text_channel_id, role_id = after_channel_link
-                _, after_text_channel, role = get_guild_entities(
-                    guild_id, text_channel_id, role_id
-                )
-
-                if after_text_channel:
-                    custom_msg = await get_custom_message(guild_id, "join")
-                    message = (
-                        replace_tokens(
-                            custom_msg,
-                            member,
-                            channel=after.channel,
-                            role=role,
-                        )
-                        if custom_msg
-                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
-                    )
-                    await after_text_channel.send(message)
-
-            elif before_channel_link and not after_channel_link:
-                # Transitioning from a database channel to a non-database channel
-                guild_id, text_channel_id, role_id = before_channel_link
-                _, before_text_channel, role = get_guild_entities(
-                    guild_id, text_channel_id, role_id
-                )
-
-                if before_text_channel:
-                    custom_msg = await get_custom_message(guild_id, "leave")
-                    message = (
-                        replace_tokens(
-                            custom_msg,
-                            member,
-                            channel=before.channel,
-                            role=role,
-                        )
-                        if custom_msg
-                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
-                    )
-                    await before_text_channel.send(message)
-
-            elif before_channel_link and after_channel_link:
-                # Transitioning between database channels
-                before_guild_id, before_text_channel_id, before_role_id = (
-                    before_channel_link
-                )
-                after_guild_id, after_text_channel_id, after_role_id = (
-                    after_channel_link
-                )
-
-                _, before_text_channel, before_role = get_guild_entities(
-                    before_guild_id, before_text_channel_id, before_role_id
-                )
-                _, after_text_channel, after_role = get_guild_entities(
-                    after_guild_id, after_text_channel_id, after_role_id
-                )
-
-                if (
-                    before_text_channel
-                    and after_text_channel
-                    and before_text_channel == after_text_channel
-                ):
-                    # Same text channel for both before and after channels
-                    custom_msg = await get_custom_message(before_guild_id, "move")
-                    message = (
-                        replace_tokens(
-                            custom_msg,
-                            member,
-                            old_channel=before.channel,
-                            new_channel=after.channel,
-                            role=after_role,
-                        )
-                        if custom_msg
-                        else f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) moved from {before.channel.name} "
-                        f"to {after.channel.name}."
-                    )
-                    await before_text_channel.send(message)
-                else:
-                    # Separate text channels for before and after channels
-                    if before_text_channel:
-                        custom_msg = await get_custom_message(before_guild_id, "leave")
-                        leave_message = (
-                            replace_tokens(
-                                custom_msg,
-                                member,
-                                channel=before.channel,
-                                role=before_role,
-                            )
-                            if custom_msg
-                            else f"{before_role.mention if before_role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
-                        )
-                        await before_text_channel.send(leave_message)
-
-                    if after_text_channel:
-                        custom_msg = await get_custom_message(after_guild_id, "join")
-                        join_message = (
-                            replace_tokens(
-                                custom_msg,
-                                member,
-                                channel=after.channel,
-                                role=after_role,
-                            )
-                            if custom_msg
-                            else f"{after_role.mention if after_role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
-                        )
-                        await after_text_channel.send(join_message)
-
-        # Handle leaving a voice channel
-        elif before.channel and not after.channel:
-            voice_channel_id = str(before.channel.id)
-            channel_link = await get_channel_link(voice_channel_id)
-
-            if channel_link:
-                guild_id, text_channel_id, role_id = channel_link
-                _, text_channel, role = get_guild_entities(
-                    guild_id, text_channel_id, role_id
-                )
-
-                if text_channel:
-                    custom_msg = await get_custom_message(guild_id, "leave")
-                    message = (
-                        replace_tokens(
-                            custom_msg,
-                            member,
-                            channel=before.channel,
-                            role=role,
-                        )
-                        if custom_msg
-                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has left {before.channel.name}."
-                    )
-                    await text_channel.send(message)
-
-        # Handle joining a voice channel
-        elif not before.channel and after.channel:
-            voice_channel_id = str(after.channel.id)
-            channel_link = await get_channel_link(voice_channel_id)
-
-            if channel_link:
-                guild_id, text_channel_id, role_id = channel_link
-                _, text_channel, role = get_guild_entities(
-                    guild_id, text_channel_id, role_id
-                )
-
-                if text_channel:
-                    custom_msg = await get_custom_message(guild_id, "join")
-                    message = (
-                        replace_tokens(
-                            custom_msg,
-                            member,
-                            channel=after.channel,
-                            role=role,
-                        )
-                        if custom_msg
-                        else f"{role.mention if role else ''} {member.display_name}({member.name}) has joined {after.channel.name}."
-                    )
-                    await text_channel.send(message)
+    @staticmethod
+    def _channel(channel):
+        return VoiceChannel(str(channel.id), channel.name) if channel else None
 
 
 async def setup(bot):
