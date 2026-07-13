@@ -1,0 +1,3 @@
+# Prefer no duplicate YouTube deliveries
+
+YouTube Notification Delivery prefers avoiding duplicate Discord messages over guaranteeing delivery across a process crash. A delivery records its dispatching intent before publishing and an unresolved dispatch after restart is not resent, accepting the smaller risk of a missed notification if the process stops after recording intent but before Discord accepts the message. Migration from global video deduplication establishes a no-replay baseline for existing subscriptions because the old data cannot identify which guild received a publication; only publications observed after activation enter the new delivery lifecycle.

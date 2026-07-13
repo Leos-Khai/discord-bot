@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -11,6 +11,13 @@ from twitch_transitions import (
     DeliveryStatus,
     TwitchDeliveryState,
     TwitchSubscription,
+)
+from youtube_notification_delivery import (
+    PublicationKind,
+    YouTubeDeliveryState,
+    YouTubeDeliveryStatus,
+    YouTubePublication,
+    YouTubeSubscription,
 )
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +72,8 @@ class DatabaseService:
         self.user_tts_voices = self.db.user_tts_voices
         self.notification_channels = self.db.notification_channels
         self.youtube_subscriptions = self.db.youtube_subscriptions
-        self.notified_videos = self.db.notified_videos
+        self.youtube_channel_observations = self.db.youtube_channel_observations
+        self.youtube_delivery_states = self.db.youtube_delivery_states
         self.twitch_subscriptions = self.db.twitch_subscriptions
         self.twitch_stream_status = self.db.twitch_stream_status
         self.youtube_channel_meta = self.db.youtube_channel_meta
@@ -84,7 +92,13 @@ class DatabaseService:
         await self.youtube_subscriptions.create_index(
             [("guild_id", 1), ("youtube_channel_id", 1)], unique=True
         )
-        await self.notified_videos.create_index("video_id", unique=True)
+        await self.youtube_channel_observations.create_index(
+            "youtube_channel_id", unique=True
+        )
+        await self.youtube_delivery_states.create_index(
+            [("guild_id", 1), ("youtube_channel_id", 1), ("publication_id", 1)],
+            unique=True,
+        )
         await self.twitch_subscriptions.create_index(
             [("guild_id", 1), ("twitch_username", 1)], unique=True
         )
@@ -93,6 +107,22 @@ class DatabaseService:
         )
         await self.youtube_channel_meta.create_index("channel_id", unique=True)
         await self.twitch_user_meta.create_index("username", unique=True)
+
+        baseline = datetime.now(timezone.utc).isoformat()
+        for channel_id in await self.youtube_subscriptions.distinct(
+            "youtube_channel_id"
+        ):
+            await self.youtube_channel_observations.update_one(
+                {"youtube_channel_id": channel_id},
+                {
+                    "$setOnInsert": {
+                        "youtube_channel_id": channel_id,
+                        "cursor": baseline,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+                upsert=True,
+            )
 
     # ---- Servers ------------------------------------------------------- #
     async def add_server(self, server_id: str) -> None:
@@ -335,10 +365,20 @@ class DatabaseService:
                     "youtube_channel_id": youtube_channel_id,
                     "notification_channel_id": notification_channel_id,
                     "channel_title": channel_title,
-                    "last_checked": now,
                     "created_at": now,
                     "updated_at": now,
                 }
+            )
+            await self.youtube_channel_observations.update_one(
+                {"youtube_channel_id": youtube_channel_id},
+                {
+                    "$setOnInsert": {
+                        "youtube_channel_id": youtube_channel_id,
+                        "cursor": now.isoformat(),
+                        "updated_at": now,
+                    }
+                },
+                upsert=True,
             )
         except DuplicateKeyError as e:
             raise DatabaseError("YouTube channel already tracked for this guild.") from e
@@ -347,6 +387,17 @@ class DatabaseService:
         result = await self.youtube_subscriptions.delete_one(
             {"guild_id": guild_id, "youtube_channel_id": youtube_channel_id}
         )
+        if result.deleted_count:
+            await self.youtube_delivery_states.delete_many(
+                {"guild_id": guild_id, "youtube_channel_id": youtube_channel_id}
+            )
+            remaining = await self.youtube_subscriptions.count_documents(
+                {"youtube_channel_id": youtube_channel_id}, limit=1
+            )
+            if not remaining:
+                await self.youtube_channel_observations.delete_one(
+                    {"youtube_channel_id": youtube_channel_id}
+                )
         return result.deleted_count > 0
 
     async def get_youtube_subscriptions(self) -> List[Dict[str, Any]]:
@@ -359,25 +410,139 @@ class DatabaseService:
         cursor = self.youtube_subscriptions.find({"guild_id": guild_id})
         return await cursor.to_list(None)
 
-    async def update_youtube_last_checked(
-        self, guild_id: str, youtube_channel_id: str, checked_at: Optional[datetime] = None
+    async def tracked_youtube_subscriptions(self) -> List[YouTubeSubscription]:
+        subscriptions = await self.get_youtube_subscriptions()
+        return [
+            YouTubeSubscription(
+                guild_id=str(subscription["guild_id"]),
+                youtube_channel_id=str(subscription["youtube_channel_id"]),
+                notification_channel_id=str(subscription["notification_channel_id"]),
+                subscribed_at=self._aware_datetime(
+                    subscription.get("created_at") or datetime.now(timezone.utc)
+                ),
+                channel_title=subscription.get("channel_title"),
+            )
+            for subscription in subscriptions
+        ]
+
+    async def youtube_observation_cursor(self, channel_id: str) -> Optional[str]:
+        observation = await self.youtube_channel_observations.find_one(
+            {"youtube_channel_id": channel_id}, {"cursor": 1}
+        )
+        return observation.get("cursor") if observation else None
+
+    async def record_youtube_observation(
+        self,
+        channel_id: str,
+        cursor: str,
+        deliveries: Sequence[YouTubeDeliveryState],
     ) -> None:
-        await self.youtube_subscriptions.update_one(
-            {"guild_id": guild_id, "youtube_channel_id": youtube_channel_id},
-            {"$set": {"last_checked": checked_at or datetime.now(timezone.utc)}},
+        for delivery in deliveries:
+            document = self._youtube_delivery_document(delivery)
+            await self.youtube_delivery_states.update_one(
+                self._youtube_delivery_filter(delivery),
+                {"$setOnInsert": document},
+                upsert=True,
+            )
+        await self.youtube_channel_observations.update_one(
+            {"youtube_channel_id": channel_id},
+            {
+                "$set": {
+                    "cursor": cursor,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
         )
 
-    async def mark_video_notified(self, video_id: str) -> None:
-        try:
-            await self.notified_videos.insert_one(
-                {"video_id": video_id, "notified_at": datetime.utcnow()}
-            )
-        except DuplicateKeyError:
-            return
+    async def pending_youtube_deliveries(self) -> List[YouTubeDeliveryState]:
+        cursor = self.youtube_delivery_states.find(
+            {"delivery_status": YouTubeDeliveryStatus.PENDING.value}
+        )
+        return [
+            self._youtube_delivery_state(document)
+            for document in await cursor.to_list(None)
+        ]
 
-    async def is_video_notified(self, video_id: str) -> bool:
-        doc = await self.notified_videos.find_one({"video_id": video_id}, {"_id": 1})
-        return doc is not None
+    async def save_youtube_delivery(self, delivery: YouTubeDeliveryState) -> None:
+        result = await self.youtube_delivery_states.update_one(
+            self._youtube_delivery_filter(delivery),
+            {
+                "$set": {
+                    "delivery_status": delivery.delivery_status.value,
+                    "delivery_attempts": delivery.delivery_attempts,
+                    "message_id": delivery.message_id,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if result.matched_count != 1:
+            raise DatabaseError(
+                "YouTube delivery no longer exists; dispatch was not persisted."
+            )
+
+    @staticmethod
+    def _youtube_delivery_filter(delivery: YouTubeDeliveryState) -> dict:
+        return {
+            "guild_id": delivery.guild_id,
+            "youtube_channel_id": delivery.youtube_channel_id,
+            "publication_id": delivery.publication.publication_id,
+        }
+
+    @staticmethod
+    def _aware_datetime(value) -> datetime:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    @classmethod
+    def _youtube_delivery_document(cls, delivery: YouTubeDeliveryState) -> dict:
+        publication = delivery.publication
+        now = datetime.now(timezone.utc)
+        return {
+            "guild_id": delivery.guild_id,
+            "youtube_channel_id": delivery.youtube_channel_id,
+            "publication_id": publication.publication_id,
+            "publication": {
+                "channel_id": publication.channel_id,
+                "title": publication.title,
+                "url": publication.url,
+                "thumbnail_url": publication.thumbnail_url,
+                "channel_name": publication.channel_name,
+                "published_at": publication.published_at,
+                "kind": publication.kind.value,
+            },
+            "delivery_status": delivery.delivery_status.value,
+            "delivery_attempts": delivery.delivery_attempts,
+            "message_id": delivery.message_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    @classmethod
+    def _youtube_delivery_state(cls, document: dict) -> YouTubeDeliveryState:
+        publication = document["publication"]
+        try:
+            kind = PublicationKind(publication.get("kind", PublicationKind.VIDEO.value))
+        except ValueError:
+            kind = PublicationKind.VIDEO
+        return YouTubeDeliveryState(
+            guild_id=str(document["guild_id"]),
+            youtube_channel_id=str(document["youtube_channel_id"]),
+            publication=YouTubePublication(
+                publication_id=str(document["publication_id"]),
+                channel_id=str(publication["channel_id"]),
+                title=publication["title"],
+                url=publication["url"],
+                thumbnail_url=publication.get("thumbnail_url", ""),
+                channel_name=publication["channel_name"],
+                published_at=cls._aware_datetime(publication["published_at"]),
+                kind=kind,
+            ),
+            delivery_status=YouTubeDeliveryStatus(document["delivery_status"]),
+            delivery_attempts=int(document.get("delivery_attempts", 0)),
+            message_id=document.get("message_id"),
+        )
 
     async def add_twitch_subscription(
         self,
@@ -693,20 +858,6 @@ async def get_youtube_subscriptions():
 
 async def get_youtube_subscriptions_by_guild(guild_id: str):
     return await _db_service.get_youtube_subscriptions_by_guild(guild_id)
-
-
-async def update_youtube_last_checked(guild_id: str, youtube_channel_id: str, checked_at=None):
-    return await _db_service.update_youtube_last_checked(
-        guild_id, youtube_channel_id, checked_at
-    )
-
-
-async def mark_video_notified(video_id: str):
-    return await _db_service.mark_video_notified(video_id)
-
-
-async def is_video_notified(video_id: str):
-    return await _db_service.is_video_notified(video_id)
 
 
 async def add_twitch_subscription(

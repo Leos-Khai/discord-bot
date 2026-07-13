@@ -15,10 +15,7 @@ from db import (
     get_database_service,
     get_notification_channel,
     get_twitch_subscriptions_by_guild,
-    get_youtube_subscriptions,
     get_youtube_subscriptions_by_guild,
-    is_video_notified,
-    mark_video_notified,
     remove_twitch_subscription,
     remove_youtube_subscription,
     set_notification_channel,
@@ -30,6 +27,13 @@ from twitch_transitions import (
     TwitchSubscription,
     TwitchTransitions,
 )
+from youtube_notification_delivery import (
+    PublicationKind,
+    YouTubeNotificationDelivery,
+    YouTubePublication,
+    YouTubeSubscription,
+)
+from youtube_platform import YouTubeApiAdapter
 
 
 class TwitchApiAdapter:
@@ -98,6 +102,72 @@ class DiscordTwitchPublisher:
         return channel
 
 
+class MongoYouTubeNotificationStore:
+    def __init__(self, database):
+        self._database = database
+
+    async def tracked_subscriptions(self):
+        return await self._database.tracked_youtube_subscriptions()
+
+    async def observation_cursor(self, channel_id):
+        return await self._database.youtube_observation_cursor(channel_id)
+
+    async def record_observation(self, channel_id, cursor, deliveries):
+        await self._database.record_youtube_observation(
+            channel_id, cursor, deliveries
+        )
+
+    async def pending_deliveries(self):
+        return await self._database.pending_youtube_deliveries()
+
+    async def save_delivery(self, delivery):
+        await self._database.save_youtube_delivery(delivery)
+
+
+class DiscordYouTubePublisher:
+    _TYPE_LABELS = {
+        PublicationKind.LIVE: "Live",
+        PublicationKind.UPCOMING_STREAM: "Upcoming stream",
+        PublicationKind.ARCHIVED_STREAM: "Archived stream",
+        PublicationKind.VIDEO: "Video",
+    }
+    _AUTHOR_ACTIONS = {
+        PublicationKind.LIVE: "is live!",
+        PublicationKind.UPCOMING_STREAM: "scheduled a stream!",
+        PublicationKind.ARCHIVED_STREAM: "published a stream recording!",
+        PublicationKind.VIDEO: "uploaded a new video!",
+    }
+
+    def __init__(self, bot):
+        self._bot = bot
+
+    async def publish(
+        self, subscription: YouTubeSubscription, publication: YouTubePublication
+    ) -> str:
+        channel = self._bot.get_channel(int(subscription.notification_channel_id))
+        if channel is None:
+            raise RuntimeError(
+                f"Discord channel {subscription.notification_channel_id} is unavailable"
+            )
+        embed = discord.Embed(
+            title=publication.title,
+            url=publication.url,
+            color=0xFF0000,
+            timestamp=publication.published_at,
+        )
+        embed.set_author(
+            name=f"{publication.channel_name} {self._AUTHOR_ACTIONS[publication.kind]}"
+        )
+        embed.add_field(
+            name="Type", value=self._TYPE_LABELS[publication.kind], inline=True
+        )
+        if publication.thumbnail_url:
+            embed.set_thumbnail(url=publication.thumbnail_url)
+        embed.set_footer(text="YouTube")
+        message = await channel.send(embed=embed)
+        return str(message.id)
+
+
 class Notifications(commands.Cog):
     """YouTube and Twitch notifications with per-subscription channels."""
 
@@ -127,9 +197,20 @@ class Notifications(commands.Cog):
             "twitch_client_secret"
         )
         self.twitch_token: Optional[str] = None
+        database = get_database_service()
+        self.youtube_delivery = (
+            YouTubeNotificationDelivery(
+                YouTubeApiAdapter(self.youtube_api_key, logger=self.logger),
+                MongoYouTubeNotificationStore(database),
+                DiscordYouTubePublisher(bot),
+                logger=self.logger,
+            )
+            if self.youtube_api_key
+            else None
+        )
         self.twitch_transitions = TwitchTransitions(
             TwitchApiAdapter(self._get_twitch_streams, self._get_twitch_vod_url),
-            get_database_service(),
+            database,
             DiscordTwitchPublisher(bot, self._send_twitch_notification),
             logger=self.logger,
         )
@@ -157,85 +238,8 @@ class Notifications(commands.Cog):
     async def check_youtube(self):
         """Poll YouTube subscriptions for new uploads."""
         try:
-            subscriptions = await get_youtube_subscriptions()
-            self.logger.info(f"[YouTube] Checking {len(subscriptions)} subscription(s)")
-
-            for sub in subscriptions:
-                guild_id = sub["guild_id"]
-                youtube_channel_id = sub["youtube_channel_id"]
-                channel_title = sub.get("channel_title", youtube_channel_id)
-                notification_channel_id = sub["notification_channel_id"]
-
-                # Use created_at as the reference point - only notify for videos
-                # published AFTER the subscription was added. The notified_videos
-                # collection prevents duplicate notifications.
-                raw_created_at = sub.get("created_at") or datetime.now(timezone.utc)
-                since = datetime.now(timezone.utc)
-
-                if isinstance(raw_created_at, datetime):
-                    since = raw_created_at
-                    if raw_created_at.tzinfo is None:
-                        since = raw_created_at.replace(tzinfo=timezone.utc)
-                elif isinstance(raw_created_at, str):
-                    try:
-                        parsed = datetime.fromisoformat(raw_created_at)
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=timezone.utc)
-                        since = parsed
-                    except ValueError:
-                        self.logger.warning(
-                            f"[YouTube] Invalid created_at format for {channel_title}: {raw_created_at}"
-                        )
-                else:
-                    self.logger.warning(
-                        f"[YouTube] Unexpected created_at type for {channel_title}: {type(raw_created_at)}"
-                    )
-
-                self.logger.debug(
-                    f"[YouTube] Checking {channel_title} (ID: {youtube_channel_id}) for videos since {since.isoformat()}"
-                )
-
-                videos = await self._get_youtube_videos(youtube_channel_id, since)
-
-                if not videos:
-                    self.logger.debug(f"[YouTube] No new videos for {channel_title}")
-                    continue
-
-                self.logger.info(f"[YouTube] Found {len(videos)} video(s) since subscription for {channel_title}")
-
-                notification_channel = self.bot.get_channel(int(notification_channel_id))
-                if not notification_channel:
-                    self.logger.error(
-                        f"[YouTube] Notification channel {notification_channel_id} not found for {channel_title} (guild: {guild_id})"
-                    )
-                    continue
-
-                notified_count = 0
-                for video in videos:
-                    video_id = video["id"]
-                    video_title = video["title"]
-
-                    if await is_video_notified(video_id):
-                        self.logger.debug(
-                            f"[YouTube] Skipping already notified video: {video_title} (ID: {video_id})"
-                        )
-                        continue
-
-                    try:
-                        await self._send_youtube_notification(notification_channel, video)
-                        await mark_video_notified(video_id)
-                        notified_count += 1
-                        self.logger.info(
-                            f"[YouTube] Sent notification for: {video_title} (ID: {video_id}) from {channel_title}"
-                        )
-                    except Exception as send_err:
-                        self.logger.error(
-                            f"[YouTube] Failed to send notification for {video_title}: {send_err}"
-                        )
-
-                if notified_count > 0:
-                    self.logger.info(f"[YouTube] Sent {notified_count} new notification(s) for {channel_title}")
-
+            if self.youtube_delivery:
+                await self.youtube_delivery.poll()
         except Exception as e:
             self.logger.error(f"[YouTube] Error in check loop: {e}", exc_info=True)
 
@@ -248,135 +252,6 @@ class Notifications(commands.Cog):
             self.logger.error(f"[Twitch] Error in check loop: {e}", exc_info=True)
 
     # --- External API helpers --------------------------------------------
-    async def _get_youtube_videos(self, channel_id: str, since: datetime):
-        """Fetch recent videos from a YouTube channel."""
-        if not self.youtube_api_key:
-            self.logger.warning("[YouTube API] No API key configured")
-            return []
-
-        if isinstance(since, str):
-            try:
-                since = datetime.fromisoformat(since)
-            except ValueError:
-                self.logger.warning(f"[YouTube API] Invalid since datetime string: {since}")
-                since = datetime.now(timezone.utc)
-        if not isinstance(since, datetime):
-            since = datetime.now(timezone.utc)
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-
-        async with aiohttp.ClientSession() as session:
-            # Step 1: Get the uploads playlist ID
-            url = "https://www.googleapis.com/youtube/v3/channels"
-            params = {
-                "key": self.youtube_api_key,
-                "id": channel_id,
-                "part": "contentDetails",
-            }
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    response_text = await resp.text()
-                    self.logger.error(
-                        f"[YouTube API] Failed to get channel {channel_id}: "
-                        f"HTTP {resp.status} - {response_text[:500]}"
-                    )
-                    return []
-                data = await resp.json()
-
-                # Check for API errors in response
-                if "error" in data:
-                    error_info = data["error"]
-                    self.logger.error(
-                        f"[YouTube API] API error for channel {channel_id}: "
-                        f"Code {error_info.get('code')} - {error_info.get('message')}"
-                    )
-                    return []
-
-                if not data.get("items"):
-                    self.logger.warning(
-                        f"[YouTube API] No channel found for ID: {channel_id}"
-                    )
-                    return []
-
-                uploads_playlist = data["items"][0]["contentDetails"]["relatedPlaylists"][
-                    "uploads"
-                ]
-                self.logger.debug(
-                    f"[YouTube API] Channel {channel_id} uploads playlist: {uploads_playlist}"
-                )
-
-            # Step 2: Get recent videos from uploads playlist
-            url = "https://www.googleapis.com/youtube/v3/playlistItems"
-            params = {
-                "key": self.youtube_api_key,
-                "playlistId": uploads_playlist,
-                "part": "snippet",
-                "maxResults": 25,
-            }
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    response_text = await resp.text()
-                    self.logger.error(
-                        f"[YouTube API] Failed to get playlist {uploads_playlist}: "
-                        f"HTTP {resp.status} - {response_text[:500]}"
-                    )
-                    return []
-                data = await resp.json()
-
-                # Check for API errors in response
-                if "error" in data:
-                    error_info = data["error"]
-                    self.logger.error(
-                        f"[YouTube API] API error for playlist {uploads_playlist}: "
-                        f"Code {error_info.get('code')} - {error_info.get('message')}"
-                    )
-                    return []
-
-        items = data.get("items", [])
-        self.logger.debug(
-            f"[YouTube API] Retrieved {len(items)} items from playlist for channel {channel_id}"
-        )
-
-        videos = []
-        skipped_older = 0
-        for item in items:
-            try:
-                published = datetime.fromisoformat(
-                    item["snippet"]["publishedAt"].replace("Z", "+00:00")
-                )
-                video_id = item["snippet"]["resourceId"]["videoId"]
-                video_title = item["snippet"]["title"]
-
-                if published > since:
-                    videos.append(
-                        {
-                            "id": video_id,
-                            "title": video_title,
-                            "url": f"https://www.youtube.com/watch?v={video_id}",
-                            "thumbnail": item["snippet"]["thumbnails"].get("medium", {}).get("url", ""),
-                            "channel_name": item["snippet"]["channelTitle"],
-                            "published_at": published,
-                        }
-                    )
-                    self.logger.debug(
-                        f"[YouTube API] New video found: {video_title} (published: {published.isoformat()})"
-                    )
-                else:
-                    skipped_older += 1
-                    self.logger.debug(
-                        f"[YouTube API] Skipping older video: {video_title} "
-                        f"(published: {published.isoformat()}, since: {since.isoformat()})"
-                    )
-            except Exception as parse_err:
-                self.logger.error(
-                    f"[YouTube API] Error parsing video item: {parse_err} - Item: {item}"
-                )
-
-        self.logger.debug(
-            f"[YouTube API] Channel {channel_id}: {len(videos)} new, {skipped_older} older than {since.isoformat()}"
-        )
-        return videos
-
     async def _get_twitch_streams(self, usernames: Sequence[str]):
         """Fetch live stream info for multiple Twitch usernames."""
         token = await self.get_twitch_token()
@@ -518,18 +393,6 @@ class Notifications(commands.Cog):
                     f"[Twitch API] Failed to get token: HTTP {resp.status} - {response_text[:500]}"
                 )
                 return None
-
-    async def _send_youtube_notification(self, channel: discord.TextChannel, video: dict):
-        embed = discord.Embed(
-            title=video["title"],
-            url=video["url"],
-            color=0xFF0000,
-            timestamp=video["published_at"],
-        )
-        embed.set_author(name=f"{video['channel_name']} uploaded a new video!")
-        embed.set_thumbnail(url=video["thumbnail"])
-        embed.set_footer(text="YouTube")
-        await channel.send(embed=embed)
 
     async def _resolve_youtube_channel(
         self, raw_identifier: str
