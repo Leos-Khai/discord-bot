@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 import edge_tts
 
-from command_help import describe_parameters
+from command_help import apply_parameter_descriptions, describe_parameters
 from db import get_database_service
 from guild_command_access import GuildCommandChannelAccess
 from logger import get_logger
@@ -64,6 +64,7 @@ class VoiceListView(discord.ui.View):
 class TtsCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        apply_parameter_descriptions(self)
         self.logger = get_logger()
         self.preferences = TtsPreferences(get_database_service())
         self.command_access: GuildCommandChannelAccess = bot.guild_command_access

@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
-from command_help import describe_parameters
+from command_help import apply_parameter_descriptions, describe_parameters
 from db import get_playback_volume, set_playback_volume
 from guild_command_access import GuildCommandChannelAccess
 from guild_playback import GuildPlayback, OutcomeKind, PlaybackOutcome, Track, TrackRequest
@@ -147,6 +147,7 @@ class DiscordOutcomeAdapter:
 class MusicCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        apply_parameter_descriptions(self)
         self.logger = get_logger()
         self.media = YtdlpMediaAdapter(self.logger)
         self.command_access: GuildCommandChannelAccess = bot.guild_command_access

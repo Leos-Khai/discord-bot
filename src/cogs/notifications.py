@@ -7,7 +7,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-from command_help import describe_parameters
+from command_help import apply_parameter_descriptions, describe_parameters
 from cogs.admin import is_admin
 from db import (
     add_twitch_subscription,
@@ -103,6 +103,7 @@ class Notifications(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        apply_parameter_descriptions(self)
         self.logger = get_logger()
 
         # Load API keys (env first, fallback to config.json for local dev)

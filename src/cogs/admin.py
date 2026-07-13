@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from command_help import describe_parameters
+from command_help import apply_parameter_descriptions, describe_parameters
 from db import (
     get_channel_links_by_guild,
     get_servers,
@@ -26,6 +26,7 @@ def is_admin():
 class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        apply_parameter_descriptions(self)
         self.command_access: GuildCommandChannelAccess = bot.guild_command_access
 
     @commands.command(help="Lists all active channel links in the current server.")

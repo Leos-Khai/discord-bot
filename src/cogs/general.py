@@ -1,12 +1,13 @@
 import discord
 from discord.ext import commands
-from command_help import describe_parameters
+from command_help import apply_parameter_descriptions, describe_parameters
 from cogs.admin import is_admin
 
 
 class General(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        apply_parameter_descriptions(self)
 
     @commands.command(help="Shows the bot's latency in milliseconds.\nUsage: !ping")
     @is_admin()

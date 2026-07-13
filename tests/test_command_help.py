@@ -7,7 +7,11 @@ from discord.ext import commands
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from command_help import HelpfulHelpCommand, describe_parameters
+from command_help import (
+    HelpfulHelpCommand,
+    apply_parameter_descriptions,
+    describe_parameters,
+)
 
 
 class CommandHelpTests(unittest.TestCase):
@@ -35,12 +39,17 @@ class CommandHelpTests(unittest.TestCase):
     def test_renders_canonical_help_without_a_hard_coded_usage_prefix(self):
         from cogs.notifications import Notifications
 
+        cog = Notifications.__new__(Notifications)
+        apply_parameter_descriptions(cog)
         help_command = HelpfulHelpCommand()
         help_command.context = SimpleNamespace(clean_prefix="?")
-        help_command.add_command_formatting(Notifications.youtube_add)
+        help_command.add_command_formatting(cog.youtube_add)
         rendered = "\n".join(help_command.paginator.pages)
 
         self.assertIn("?notifications youtube add <channel_id> [channel]", rendered)
+        self.assertIn("YouTube channel ID, channel URL, or @handle to track.", rendered)
+        self.assertIn("Optional text channel for this subscription; otherwise use the default.", rendered)
+        self.assertNotIn("No description given", rendered)
         self.assertNotIn("Usage:", rendered)
 
     def test_attaches_descriptions_to_prefix_help_parameters(self):
@@ -54,6 +63,17 @@ class CommandHelpTests(unittest.TestCase):
             add.params["channel_id"].description,
         )
 
+    def test_cog_command_copies_keep_parameter_descriptions(self):
+        from cogs.notifications import Notifications
+
+        cog = Notifications.__new__(Notifications)
+        apply_parameter_descriptions(cog)
+
+        self.assertEqual(
+            "YouTube channel ID, channel URL, or @handle to track.",
+            cog.youtube_add.params["channel_id"].description,
+        )
+
     def test_all_user_facing_command_parameters_have_descriptions(self):
         from cogs.admin import Admin
         from cogs.general import General
@@ -62,7 +82,9 @@ class CommandHelpTests(unittest.TestCase):
         from cogs.tts import TtsCommands
 
         missing = []
-        for cog in (Admin, General, MusicCommands, Notifications, TtsCommands):
+        for cog_class in (Admin, General, MusicCommands, Notifications, TtsCommands):
+            cog = cog_class.__new__(cog_class)
+            apply_parameter_descriptions(cog)
             for command in cog.__cog_commands__:
                 for parameter in command.clean_params.values():
                     if parameter.description is None:
@@ -71,7 +93,9 @@ class CommandHelpTests(unittest.TestCase):
         self.assertEqual([], missing)
 
         missing_help = []
-        for cog in (Admin, General, MusicCommands, Notifications, TtsCommands):
+        for cog_class in (Admin, General, MusicCommands, Notifications, TtsCommands):
+            cog = cog_class.__new__(cog_class)
+            apply_parameter_descriptions(cog)
             for command in cog.__cog_commands__:
                 if not (command.help or command.brief or command.description):
                     missing_help.append(command.qualified_name)

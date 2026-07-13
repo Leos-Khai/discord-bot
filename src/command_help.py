@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from discord.ext import commands
 
@@ -49,6 +49,18 @@ def describe_parameters(
             raise ValueError(f"Unknown command parameter(s): {names}")
         for name, description in descriptions.items():
             command.params[name] = command.params[name].replace(description=description)
+        command.callback.__command_parameter_descriptions__ = descriptions
         return command
 
     return decorate
+
+
+def apply_parameter_descriptions(cog: commands.Cog) -> None:
+    """Restore descriptions after discord.py copies a Cog's commands."""
+
+    for command in cog.walk_commands():
+        descriptions: Mapping[str, str] = getattr(
+            command.callback, "__command_parameter_descriptions__", {}
+        )
+        for name, description in descriptions.items():
+            command.params[name] = command.params[name].replace(description=description)
