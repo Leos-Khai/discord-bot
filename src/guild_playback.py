@@ -6,6 +6,19 @@ from enum import StrEnum
 from typing import Callable, Optional, Protocol
 
 from logger import get_logger
+from seek_request import parse_seek_request
+
+SEEK_FORMAT_HELP = (
+    "Invalid time. Use `78`, `1:30`, `1:00:00`, or relative `+30` / `-1:00`."
+)
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "N/A"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
 
 @dataclass(frozen=True)
@@ -48,12 +61,17 @@ class OutcomeKind(StrEnum):
     SKIPPED = "skipped"
     CLEARED = "cleared"
     REMOVED = "removed"
+    SOUGHT = "sought"
 
 
 class VoiceAdapter(Protocol):
     async def ensure_connected(self, channel_id: object) -> None: ...
     async def play(
-        self, track: Track, volume: float, after: Callable[[Optional[Exception]], None]
+        self,
+        track: Track,
+        volume: float,
+        after: Callable[[Optional[Exception]], None],
+        start_at: float = 0.0,
     ) -> None: ...
     def is_playing(self) -> bool: ...
     def is_paused(self) -> bool: ...
@@ -99,7 +117,7 @@ class GuildPlayback:
         self._queue: list[Track] = []
         self._current: Optional[Track] = None
         self._volume: Optional[float] = None
-        self._playback_started_at: Optional[float] = None
+        self._position_epoch: Optional[float] = None
         self._paused_at: Optional[float] = None
         self._loader: Optional[asyncio.Task[None]] = None
         self._loading_entries: list[TrackRequest | Track] = []
@@ -222,9 +240,9 @@ class GuildPlayback:
         return bool(self._loading_entries or (self._loader and not self._loader.done()))
 
     def position(self) -> Optional[float]:
-        if self._playback_started_at is None:
+        if self._position_epoch is None:
             return None
-        return max(0.0, (self._paused_at or self._loop.time()) - self._playback_started_at)
+        return max(0.0, (self._paused_at or self._loop.time()) - self._position_epoch)
 
     async def join(self, voice_channel_id: object) -> PlaybackOutcome:
         async with self._lock:
@@ -245,8 +263,8 @@ class GuildPlayback:
             if not self._voice.is_paused():
                 return PlaybackOutcome("failed", detail="Music is not paused")
             self._voice.resume()
-            if self._paused_at is not None and self._playback_started_at is not None:
-                self._playback_started_at += self._loop.time() - self._paused_at
+            if self._paused_at is not None and self._position_epoch is not None:
+                self._position_epoch += self._loop.time() - self._paused_at
             self._paused_at = None
             return PlaybackOutcome("resumed")
 
@@ -256,6 +274,44 @@ class GuildPlayback:
                 return PlaybackOutcome("failed", detail="Nothing is currently playing")
             self._voice.stop()
             return PlaybackOutcome("skipped", self._current)
+
+    async def seek(self, text: str) -> PlaybackOutcome:
+        request = parse_seek_request(text)
+        if request is None:
+            return PlaybackOutcome("failed", detail=SEEK_FORMAT_HELP)
+        async with self._lock:
+            self._ensure_open()
+            track = self._current
+            if not track:
+                return PlaybackOutcome("failed", detail="Nothing is currently playing")
+            if track.duration is None:
+                return PlaybackOutcome(
+                    "failed",
+                    track,
+                    detail=f"Cannot seek in **{track.title}** because its length is unknown.",
+                )
+            target = float(request.seconds)
+            if request.relative:
+                target += self.position() or 0.0
+            # Landing on the final instant yields an empty stream, which would end the
+            # track; refusing keeps a seek from quietly becoming a skip.
+            if target >= track.duration:
+                return PlaybackOutcome(
+                    "failed",
+                    track,
+                    detail=(
+                        f"Cannot seek to **{format_duration(target)}** — "
+                        f"**{track.title}** is only **{format_duration(track.duration)}** long."
+                    ),
+                )
+            target = max(0.0, target)
+            if request.relative and request.seconds == 0:
+                # Restarting the stream to land where playback already is would cost an
+                # audible gap for nothing.
+                return PlaybackOutcome("sought", track, detail=str(int(target)))
+            await self._voice.play(track, self._volume or 1.0, self._after_track, start_at=target)
+            self._position_epoch = (self._paused_at or self._loop.time()) - target
+            return PlaybackOutcome("sought", track, detail=str(int(target)))
 
     async def start_queued_if_idle(self) -> Optional[PlaybackOutcome]:
         """Starts a queued track after another audio feature releases the voice client."""
@@ -302,7 +358,7 @@ class GuildPlayback:
     async def _start_locked(self, track: Track) -> PlaybackOutcome:
         await self._voice.play(track, self._volume or 1.0, self._after_track)
         self._current = track
-        self._playback_started_at = self._loop.time()
+        self._position_epoch = self._loop.time()
         self._paused_at = None
         return PlaybackOutcome("started", track)
 
@@ -318,7 +374,7 @@ class GuildPlayback:
             if self._closed:
                 return
             self._current = None
-            self._playback_started_at = None
+            self._position_epoch = None
             self._paused_at = None
             if error:
                 self._logger.warning("Playback failed for guild %s: %s", self.guild_id, error)
@@ -344,7 +400,7 @@ class GuildPlayback:
             self._loading_entries.clear()
             self._queue.clear()
             self._current = None
-            self._playback_started_at = None
+            self._position_epoch = None
             self._paused_at = None
             if disconnect:
                 await self._voice.disconnect()

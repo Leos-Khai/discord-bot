@@ -61,4 +61,10 @@ Module-level wrapper functions maintain backward compatibility. `initialize_data
 
 ## Testing
 
-No automated test suite. Test changes manually by running the bot in a test guild and exercising affected commands/events. Check `logs/discord_bot.log` for errors.
+```bash
+python -m unittest discover -s tests -t tests
+```
+
+Tests use the stdlib `unittest` runner (`IsolatedAsyncioTestCase` for async code) and live in `tests/`, each inserting `src/` onto `sys.path`. They cover the pure modules and the guild-scoped domain objects through hand-written fakes (`FakeVoice`, `RecordingAudio`); Discord and network adapters are not covered.
+
+For changes that touch Discord or ffmpeg directly, also run the bot in a test guild and exercise the affected commands/events. Check `logs/discord_bot.log` for errors.

@@ -12,6 +12,7 @@ class FakeVoice:
     def __init__(self):
         self.connected_to = None
         self.played = []
+        self.start_positions = []
         self.after = None
         self.paused = False
         self.playing = False
@@ -21,8 +22,9 @@ class FakeVoice:
     async def ensure_connected(self, channel_id):
         self.connected_to = channel_id
 
-    async def play(self, track, volume, after):
+    async def play(self, track, volume, after, start_at=0.0):
         self.played.append(track)
+        self.start_positions.append(start_at)
         self.volume = volume
         self.after = after
         self.playing = True
@@ -57,13 +59,18 @@ class FakeVoice:
 
 
 class FakeMedia:
-    def __init__(self, failing_targets=()):
+    def __init__(self, failing_targets=(), duration=None):
         self.failing_targets = set(failing_targets)
+        self.duration = duration
 
     async def resolve(self, request):
         if request.target in self.failing_targets:
             raise RuntimeError(f"cannot resolve {request.target}")
-        return Track(title=request.target, stream_url=f"stream://{request.target}")
+        return Track(
+            title=request.target,
+            stream_url=f"stream://{request.target}",
+            duration=self.duration,
+        )
 
     async def playlist_entries(self, request):
         return [TrackRequest("first"), TrackRequest("second")]
@@ -129,6 +136,13 @@ class GuildPlaybackTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.playback.close(disconnect=False)
+
+    async def _playing_track(self, duration):
+        playback = GuildPlayback(
+            "guild-1", self.voice, FakeMedia(duration=duration), self.volumes, self.outcomes
+        )
+        await playback.enqueue(TrackRequest("first"), "voice-1")
+        return playback
 
     async def test_starts_the_first_requested_track_and_advances_the_queue(self):
         started = await self.playback.enqueue(TrackRequest("first"), "voice-1")
@@ -240,6 +254,138 @@ class GuildPlaybackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["a1"], [track.title for track in self.voice.played])
         self.assertEqual(["a2", "b1", "b2"], [track.title for track in playback.queued_tracks])
+        await playback.close(disconnect=False)
+
+    async def test_seek_restarts_the_current_track_at_an_absolute_point(self):
+        playback = await self._playing_track(duration=300)
+
+        outcome = await playback.seek("1:18")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertEqual([0.0, 78.0], self.voice.start_positions)
+        self.assertEqual(["first", "first"], [track.title for track in self.voice.played])
+        self.assertAlmostEqual(78.0, playback.position(), delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_seek_shifts_forward_from_the_current_position(self):
+        playback = await self._playing_track(duration=300)
+        await playback.seek("2:00")
+
+        outcome = await playback.seek("+30")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertAlmostEqual(150.0, self.voice.start_positions[-1], delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_seek_shifts_backward_from_the_current_position(self):
+        playback = await self._playing_track(duration=300)
+        await playback.seek("2:00")
+
+        outcome = await playback.seek("-1:00")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertAlmostEqual(60.0, self.voice.start_positions[-1], delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_seek_backward_past_the_start_restarts_the_track(self):
+        playback = await self._playing_track(duration=300)
+        await playback.seek("0:10")
+
+        outcome = await playback.seek("-1:00")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertEqual(0.0, self.voice.start_positions[-1])
+        self.assertAlmostEqual(0.0, playback.position(), delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_seek_past_the_end_is_refused_and_leaves_playback_untouched(self):
+        playback = await self._playing_track(duration=225)
+
+        outcome = await playback.seek("5:00")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertIn("03:45", outcome.detail)
+        self.assertEqual([0.0], self.voice.start_positions)
+        self.assertAlmostEqual(0.0, playback.position(), delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_seek_to_exactly_the_track_length_is_refused(self):
+        playback = await self._playing_track(duration=225)
+
+        outcome = await playback.seek("3:45")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertEqual([0.0], self.voice.start_positions)
+        await playback.close(disconnect=False)
+
+    async def test_relative_seek_past_the_end_is_refused_rather_than_ending_the_track(self):
+        playback = await self._playing_track(duration=225)
+        await playback.seek("3:40")
+
+        outcome = await playback.seek("+30")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertEqual([0.0, 220.0], self.voice.start_positions)
+        await playback.close(disconnect=False)
+
+    async def test_seek_is_refused_when_the_track_length_is_unknown(self):
+        playback = await self._playing_track(duration=None)
+
+        outcome = await playback.seek("1:00")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertIn("length is unknown", outcome.detail)
+        self.assertEqual([0.0], self.voice.start_positions)
+        await playback.close(disconnect=False)
+
+    async def test_seek_is_refused_when_nothing_is_playing(self):
+        outcome = await self.playback.seek("1:00")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertEqual([], self.voice.start_positions)
+
+    async def test_seek_is_refused_for_an_unreadable_time_without_touching_playback(self):
+        playback = await self._playing_track(duration=300)
+
+        outcome = await playback.seek("1:70")
+
+        self.assertEqual("failed", outcome.kind)
+        self.assertIn("Invalid time", outcome.detail)
+        self.assertEqual([0.0], self.voice.start_positions)
+        await playback.close(disconnect=False)
+
+    async def test_seek_while_paused_leaves_playback_paused_at_the_new_point(self):
+        playback = await self._playing_track(duration=300)
+        await playback.pause()
+
+        outcome = await playback.seek("1:30")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertTrue(self.voice.is_paused())
+        self.assertEqual(90.0, self.voice.start_positions[-1])
+        self.assertEqual(90.0, playback.position())
+        await playback.close(disconnect=False)
+
+    async def test_a_pause_spanning_a_seek_does_not_count_as_progress(self):
+        playback = await self._playing_track(duration=300)
+        await playback.pause()
+        playback._paused_at -= 60  # stand in for a minute already spent paused
+
+        await playback.seek("1:30")
+        await playback.resume()
+
+        self.assertAlmostEqual(90.0, playback.position(), delta=1.0)
+        await playback.close(disconnect=False)
+
+    async def test_a_zero_length_shift_reports_the_position_without_restarting_the_track(self):
+        playback = await self._playing_track(duration=300)
+        await playback.seek("1:30")
+
+        outcome = await playback.seek("+0")
+
+        self.assertEqual("sought", outcome.kind)
+        self.assertEqual("90", outcome.detail)
+        self.assertEqual([0.0, 90.0], self.voice.start_positions)
         await playback.close(disconnect=False)
 
     async def test_skips_a_failed_playlist_entry_and_continues_loading(self):

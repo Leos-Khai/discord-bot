@@ -11,7 +11,14 @@ import yt_dlp as youtube_dl
 from command_help import apply_parameter_descriptions, describe_parameters
 from db import get_playback_volume, set_playback_volume
 from guild_command_access import GuildCommandChannelAccess
-from guild_playback import GuildPlayback, OutcomeKind, PlaybackOutcome, Track, TrackRequest
+from guild_playback import (
+    GuildPlayback,
+    OutcomeKind,
+    PlaybackOutcome,
+    Track,
+    TrackRequest,
+    format_duration,
+)
 from logger import get_logger
 
 youtube_dl.utils.bug_reports_message = lambda *args, **kwargs: ""
@@ -197,14 +204,6 @@ class MusicCommands(commands.Cog):
             return None
         return ctx.author.voice.channel
 
-    @staticmethod
-    def _format_duration(seconds: Optional[float]) -> str:
-        if seconds is None:
-            return "N/A"
-        minutes, seconds = divmod(int(seconds), 60)
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
-
     async def _send_enqueue_outcome(self, ctx, outcome: PlaybackOutcome):
         if outcome.kind == OutcomeKind.STARTED and outcome.track:
             await ctx.send(f"Now playing: **{outcome.track.title}**")
@@ -261,7 +260,7 @@ class MusicCommands(commands.Cog):
         if not entries:
             await ctx.send("No results found.")
             return
-        lines = [f"{i}. {entry.title} ({self._format_duration(entry.duration)})" for i, entry in enumerate(entries, 1)]
+        lines = [f"{i}. {entry.title} ({format_duration(entry.duration)})" for i, entry in enumerate(entries, 1)]
         embed = discord.Embed(title="Search Results", description="\n".join(lines), color=discord.Color.blurple())
         embed.set_footer(text="React with 1-5 to choose. Expires in 30s.")
         message = await ctx.send(embed=embed)
@@ -308,7 +307,7 @@ class MusicCommands(commands.Cog):
             await ctx.send("No track is currently playing.")
             return
         position = self._playback(ctx).position()
-        suffix = f" — {self._format_duration(position)}" if position is not None else ""
+        suffix = f" — {format_duration(position)}" if position is not None else ""
         await ctx.send(f"Now playing: **{current.title}**{suffix}")
 
     @commands.hybrid_command(help="Show source details for the current track.")
@@ -321,7 +320,7 @@ class MusicCommands(commands.Cog):
         if current.uploader:
             embed.add_field(name="Channel", value=current.uploader)
         if current.duration is not None:
-            embed.add_field(name="Duration", value=self._format_duration(current.duration))
+            embed.add_field(name="Duration", value=format_duration(current.duration))
         if current.thumbnail:
             embed.set_thumbnail(url=current.thumbnail)
         await ctx.send(embed=embed)
@@ -330,6 +329,16 @@ class MusicCommands(commands.Cog):
     async def skip(self, ctx):
         outcome = await self._playback(ctx).skip()
         await ctx.send("Track skipped." if outcome.kind == OutcomeKind.SKIPPED else outcome.detail)
+
+    @describe_parameters(position="A point in the track (78, 1:30, 1:00:00) or a shift (+30, -1:00).")
+    @commands.hybrid_command(help="Seek to a point in the current track.")
+    @app_commands.describe(position="A point in the track (78, 1:30, 1:00:00) or a shift (+30, -1:00).")
+    async def seek(self, ctx, *, position: str):
+        outcome = await self._playback(ctx).seek(position)
+        if outcome.kind == OutcomeKind.SOUGHT:
+            await ctx.send(f"Seeked to **{format_duration(int(outcome.detail))}**.")
+        else:
+            await ctx.send(outcome.detail)
 
     @describe_parameters(arg="Track number to remove, or clear to empty the queue.")
     @commands.hybrid_command(help="Remove tracks from the queue.")

@@ -56,10 +56,15 @@ class _GuildAudioMixer(discord.AudioSource):
         self._speech_complete = None
         self._music_paused = False
         self._music_factor = 1.0
+        self._retired = []
         self._lock = threading.Lock()
 
     def set_music(self, source, complete):
         with self._lock:
+            if self._music:
+                # The audio thread may be mid-read on the source being replaced, so it
+                # is torn down there instead of here.
+                self._retired.append(self._music)
             self._music = source
             self._music_complete = complete
 
@@ -85,13 +90,17 @@ class _GuildAudioMixer(discord.AudioSource):
                 self._music.volume = value
 
     def read(self):
+        self._drain_retired()
         with self._lock:
             music, speech = self._music, self._speech
         music_frame = b"" if self._music_paused or not music else music.read()
         speech_frame = b"" if not speech else speech.read()
         if music and not music_frame and not self._music_paused:
-            self._finish_music(getattr(music, "_current_error", None))
-            music = None
+            self._finish_music(getattr(music, "_current_error", None), source=music)
+            # A seek may have swapped in a replacement mid-read. Re-reading tells a
+            # real ending apart from a displaced source, whose silence means nothing.
+            with self._lock:
+                music = self._music
         if speech and not speech_frame:
             self._finish_speech(speech.error)
             speech = None
@@ -103,8 +112,12 @@ class _GuildAudioMixer(discord.AudioSource):
         size = max(len(music_frame), len(speech_frame), PCM_FRAME_BYTES)
         return self._mix(music_frame.ljust(size, b"\x00"), speech_frame.ljust(size, b"\x00"), self._music_factor)
 
-    def _finish_music(self, error):
+    def _finish_music(self, error, source=None):
         with self._lock:
+            # A source displaced by a seek can still run dry on the audio thread; it
+            # must not complete the source that replaced it.
+            if source is not None and source is not self._music:
+                return
             music, complete = self._music, self._music_complete
             self._music = self._music_complete = None
         if music:
@@ -133,7 +146,14 @@ class _GuildAudioMixer(discord.AudioSource):
     def is_opus(self):
         return False
 
+    def _drain_retired(self):
+        with self._lock:
+            retired, self._retired = self._retired, []
+        for source in retired:
+            source.cleanup()
+
     def cleanup(self):
+        self._drain_retired()
         self._finish_music(RuntimeError("Guild audio stopped"))
         self._finish_speech(RuntimeError("Guild audio stopped"))
 
@@ -165,9 +185,17 @@ class DiscordGuildAudioOutput:
         if not client.is_playing():
             client.play(mixer, after=lambda error: None)
 
-    async def start_playback(self, track, volume, after):
+    async def start_playback(self, track, volume, after, start_at=0.0):
+        options = FFMPEG_OPTIONS
+        if start_at > 0:
+            # -ss ahead of the input makes ffmpeg seek the stream rather than decode
+            # and discard everything up to the target.
+            options = {
+                **FFMPEG_OPTIONS,
+                "before_options": f"-ss {start_at:.3f} {FFMPEG_OPTIONS['before_options']}",
+            }
         source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS), volume=volume
+            discord.FFmpegPCMAudio(track.stream_url, **options), volume=volume
         )
         client, mixer = self._active_mixer()
         mixer.set_music(source, after)
@@ -252,7 +280,11 @@ class GuildAudioOutput(Protocol):
     async def ensure_connected(self, channel: object) -> None: ...
 
     async def start_playback(
-        self, track: Track, volume: float, after: Callable[[Optional[Exception]], None]
+        self,
+        track: Track,
+        volume: float,
+        after: Callable[[Optional[Exception]], None],
+        start_at: float = 0.0,
     ) -> None: ...
 
     async def start_speech(
@@ -301,11 +333,16 @@ class GuildAudioCoordinator(TtsSpeaker):
         await self._output.ensure_connected(channel)
 
     async def play(
-        self, track: Track, volume: float, after: Callable[[Optional[Exception]], None]
+        self,
+        track: Track,
+        volume: float,
+        after: Callable[[Optional[Exception]], None],
+        start_at: float = 0.0,
     ) -> None:
         self._ensure_open()
+        # Pause is left alone: the only caller that plays while already active is a
+        # seek, which restarts the same track and must not silently unpause it.
         self._playback_active = True
-        self._playback_paused = False
 
         def complete(error: Optional[Exception]) -> None:
             self._playback_active = False
@@ -313,7 +350,7 @@ class GuildAudioCoordinator(TtsSpeaker):
             after(error)
 
         try:
-            await self._output.start_playback(track, volume, complete)
+            await self._output.start_playback(track, volume, complete, start_at)
         except Exception:
             self._playback_active = False
             self._playback_paused = False
