@@ -91,7 +91,7 @@ uv run pytest
 - `src/events/`: event handlers for startup, joining a server, and voice state changes.
 - `src/`: shared logic for playback, audio coordination, seeking, notifications, and the database.
 - `tests/`: pytest suite.
-- `CONTEXT.md`, `docs/adr/`: domain glossary and architecture decisions.
+- `GLOSSARY.md`, `docs/adr/`: domain glossary and architecture decisions.
 
 ## Troubleshooting
 - Bot doesn't respond: check `DISCORD_TOKEN`, the privileged intents, the bot's permissions, and the MongoDB connection.
