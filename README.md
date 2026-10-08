@@ -44,10 +44,12 @@ Link a voice channel to a text channel, and the bot posts there when members joi
 
 ### Gemini chat (admin toggle)
 When the module is set up, the bot answers with Google Gemini whenever someone @mentions it or replies to one of its messages. Each person can ask once every 10 seconds; extra requests get an ⏳ reaction. Replies never ping anyone.
+
+If `GEMINI_IMAGE_PROMPT` is set, the bot also replies to every message with a PNG, JPEG, WEBP, HEIC, or HEIF image (not GIF) with a description Gemini writes from that prompt. The same 10-second limit applies. Images over 14 MB in total per message are skipped. Edit the prompt in `.env` to change the style of the descriptions, then restart the bot.
 - `!gemini`: show whether Gemini replies are on in this server.
 - `!gemini on`, `!gemini off`: turn them on or off. They are off in every server until an admin turns them on.
 
-On Google's free tier, people at Google may read prompts and replies, and Google uses them to improve its products. Google's terms also require a paid key if the bot serves people in the EEA, the UK, or Switzerland. See the [Gemini API terms](https://ai.google.dev/gemini-api/terms).
+On Google's free tier, people at Google may read prompts, images, and replies, and Google uses them to improve its products. Google's terms also require a paid key if the bot serves people in the EEA, the UK, or Switzerland. See the [Gemini API terms](https://ai.google.dev/gemini-api/terms).
 
 ### General
 - `!ping`: show the bot's latency.
@@ -65,7 +67,7 @@ On Google's free tier, people at Google may read prompts and replies, and Google
    - `BOT_PREFIX` (defaults to `!`)
    - `MONGODB_URI`, `MONGODB_DATABASE` (required)
    - Optional, for notifications: `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
-   - Optional, for Gemini chat: `GEMINI_API_KEY` and `GEMINI_MODEL` (a current model ID from Google's [model list](https://ai.google.dev/gemini-api/docs/models)). Without both, the Gemini module doesn't load.
+   - Optional, for Gemini chat: `GEMINI_API_KEY` and `GEMINI_MODEL` (a current model ID from Google's [model list](https://ai.google.dev/gemini-api/docs/models)). Without both, the Gemini module doesn't load. Add `GEMINI_IMAGE_PROMPT` to turn on image descriptions.
 4. Run the bot:
    ```bash
    uv run bot
