@@ -316,19 +316,20 @@ class DatabaseService:
             upsert=True,
         )
 
-    # ---- Gemini -------------------------------------------------------- #
-    async def get_gemini_enabled(self, guild_id: str) -> bool:
+    # ---- Descriptions ------------------------------------------------- #
+    # The collection keeps its Gemini-era name so existing on/off choices survive.
+    async def get_description_settings(self, guild_id: str) -> dict:
         doc = await self.guild_gemini_settings.find_one(
-            {"guild_id": guild_id}, {"_id": 0, "enabled": 1}
+            {"guild_id": guild_id}, {"_id": 0, "enabled": 1, "provider": 1}
         )
-        return bool(doc and doc.get("enabled"))
+        return doc or {}
 
-    async def set_gemini_enabled(self, guild_id: str, enabled: bool) -> None:
+    async def update_description_settings(self, guild_id: str, **fields) -> None:
         now = datetime.utcnow()
         await self.guild_gemini_settings.update_one(
             {"guild_id": guild_id},
             {
-                "$set": {"enabled": enabled, "updated_at": now},
+                "$set": {**fields, "updated_at": now},
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
@@ -840,12 +841,12 @@ async def set_playback_volume(guild_id: str, volume: float):
     return await _db_service.set_playback_volume(guild_id, volume)
 
 
-async def get_gemini_enabled(guild_id: str):
-    return await _db_service.get_gemini_enabled(guild_id)
+async def get_description_settings(guild_id: str):
+    return await _db_service.get_description_settings(guild_id)
 
 
-async def set_gemini_enabled(guild_id: str, enabled: bool):
-    return await _db_service.set_gemini_enabled(guild_id, enabled)
+async def update_description_settings(guild_id: str, **fields):
+    return await _db_service.update_description_settings(guild_id, **fields)
 
 
 async def get_tts_voice(guild_id: str, user_id: str):

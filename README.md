@@ -42,12 +42,14 @@ Link a voice channel to a text channel, and the bot posts there when members joi
 - `!update_channel "Voice Name" #new-text`, `!update_role "Voice Name" @role`, `!remove_role "Voice Name"`: change a link.
 - `!set_message <join|leave|move> <message>`: customize the message using tokens like `$USER`, `$MENTION`, `$CHANNEL`, `$OLD_CHANNEL`, and `$NEW_CHANNEL`. `!set_message reset <type|all>` restores the defaults.
 
-### Gemini chat (admin toggle)
-When the module is set up, the bot answers with Google Gemini whenever someone @mentions it or replies to one of its messages. Each person can ask once every 10 seconds; extra requests get an ⏳ reaction. Replies never ping anyone.
+### AI replies and image descriptions (admin toggle)
+When the module is set up, the bot answers with Claude (Anthropic) or Gemini (Google) whenever someone @mentions it or replies to one of its messages. Each person can ask once every 10 seconds; extra requests get an ⏳ reaction. Replies never ping anyone.
 
-If `GEMINI_IMAGE_PROMPT` is set, the bot also replies to every message with a PNG, JPEG, WEBP, HEIC, or HEIF image (not GIF) with a description Gemini writes from that prompt. The same 10-second limit applies. Images over 14 MB in total per message are skipped. Edit the prompt in `.env` to change the style of the descriptions, then restart the bot.
-- `!gemini`: show whether Gemini replies are on in this server.
-- `!gemini on`, `!gemini off`: turn them on or off. They are off in every server until an admin turns them on.
+If `DESCRIPTION_IMAGE_PROMPT` is set, the bot also replies to every message with an image with a description written from that prompt. Claude takes PNG, JPEG, WEBP, and GIF images up to 7 MB each; Gemini takes PNG, JPEG, WEBP, HEIC, and HEIF. Images over 14 MB in total per message are skipped. The same 10-second limit applies. Edit the prompt in `.env` to change the style of the descriptions, then restart the bot.
+- `!description`: show whether descriptions are on in this server and which model answers.
+- `!description on`, `!description off`: turn them on or off. They are off in every server until an admin turns them on.
+- `!description model`: show the model this server uses.
+- `!description model claude`, `!description model gemini`: switch models. Servers that haven't picked one use Claude when it is set up.
 
 On Google's free tier, people at Google may read prompts, images, and replies, and Google uses them to improve its products. Google's terms also require a paid key if the bot serves people in the EEA, the UK, or Switzerland. See the [Gemini API terms](https://ai.google.dev/gemini-api/terms).
 
@@ -67,7 +69,7 @@ On Google's free tier, people at Google may read prompts, images, and replies, a
    - `BOT_PREFIX` (defaults to `!`)
    - `MONGODB_URI`, `MONGODB_DATABASE` (required)
    - Optional, for notifications: `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
-   - Optional, for Gemini chat: `GEMINI_API_KEY` and `GEMINI_MODEL` (a current model ID from Google's [model list](https://ai.google.dev/gemini-api/docs/models)). Without both, the Gemini module doesn't load. Add `GEMINI_IMAGE_PROMPT` to turn on image descriptions.
+   - Optional, for AI replies: `ANTHROPIC_API_KEY` for Claude (`CLAUDE_MODEL` defaults to `claude-haiku-5-5` and `CLAUDE_EFFORT` to `medium`), and/or `GEMINI_API_KEY` with `GEMINI_MODEL` (a current model ID from Google's [model list](https://ai.google.dev/gemini-api/docs/models)). Without either, the module doesn't load. Add `DESCRIPTION_IMAGE_PROMPT` to turn on image descriptions.
 4. Run the bot:
    ```bash
    uv run bot
@@ -89,7 +91,7 @@ uv run pytest
 
 ## Project Layout
 - `main.py`: entry point. It loads `src/main.py`.
-- `src/cogs/`: command groups (`music`, `tts`, `notifications`, `admin`, `general`, `gemini`).
+- `src/cogs/`: command groups (`music`, `tts`, `notifications`, `admin`, `general`, `description`).
 - `src/events/`: event handlers for startup, joining a server, and voice state changes.
 - `src/`: shared logic for playback, audio coordination, seeking, notifications, and the database.
 - `tests/`: pytest suite.

@@ -8,7 +8,7 @@ import discord
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from cogs.gemini import Gemini, image_attachments, is_addressed_to, prompt_from, split_reply
+from cogs.description import IMAGE_RULES, Description, image_attachments, is_addressed_to, prompt_from, split_reply
 from db import DatabaseService
 
 BOT = SimpleNamespace(id=1, bot=True)
@@ -66,7 +66,17 @@ class TriggerTests(unittest.TestCase):
         too_big = make_attachment("image/webp", size=3 * 1024 * 1024)
         small = make_attachment("image/webp", size=1024 * 1024)
 
-        self.assertEqual([png, jpeg, small], image_attachments([gif, png, untyped, jpeg, too_big, small]))
+        self.assertEqual(
+            [png, jpeg, small],
+            image_attachments([gif, png, untyped, jpeg, too_big, small], *IMAGE_RULES["gemini"]),
+        )
+
+    def test_claude_takes_gifs_but_not_heic_or_images_over_its_per_image_cap(self):
+        gif = make_attachment("image/gif")
+        heic = make_attachment("image/heic")
+        too_big = make_attachment("image/png", size=8 * 1024 * 1024)
+
+        self.assertEqual([gif], image_attachments([gif, heic, too_big], *IMAGE_RULES["claude"]))
 
 
 class FakeSettingsCollection:
@@ -85,19 +95,42 @@ class ToggleStorageTests(unittest.IsolatedAsyncioTestCase):
         database = object.__new__(DatabaseService)
         database.guild_gemini_settings = FakeSettingsCollection()
 
-        self.assertFalse(await database.get_gemini_enabled("guild-1"))
-        await database.set_gemini_enabled("guild-1", True)
-        self.assertTrue(await database.get_gemini_enabled("guild-1"))
-        self.assertFalse(await database.get_gemini_enabled("guild-2"))
-        await database.set_gemini_enabled("guild-1", False)
-        self.assertFalse(await database.get_gemini_enabled("guild-1"))
+        self.assertFalse((await database.get_description_settings("guild-1")).get("enabled"))
+        await database.update_description_settings("guild-1", enabled=True)
+        await database.update_description_settings("guild-1", provider="gemini")
+        settings = await database.get_description_settings("guild-1")
+        self.assertTrue(settings["enabled"])
+        self.assertEqual("gemini", settings["provider"])
+        self.assertEqual({}, await database.get_description_settings("guild-2"))
+        await database.update_description_settings("guild-1", enabled=False)
+        self.assertFalse((await database.get_description_settings("guild-1"))["enabled"])
+
+
+def make_bot():
+    return SimpleNamespace(user=BOT, get_context=AsyncMock(return_value=SimpleNamespace(valid=False)))
 
 
 def make_cog(reply_text="hello", image_prompt=None):
     client = MagicMock()
     client.aio.models.generate_content = AsyncMock(return_value=SimpleNamespace(text=reply_text))
-    bot = SimpleNamespace(user=BOT, get_context=AsyncMock(return_value=SimpleNamespace(valid=False)))
-    return Gemini(bot, client, "test-model", image_prompt), client.aio.models.generate_content
+    cog = Description(make_bot(), {"gemini": (client, "test-model")}, image_prompt)
+    return cog, client.aio.models.generate_content
+
+
+def make_claude_cog(image_prompt=None):
+    client = MagicMock()
+    client.messages.create = AsyncMock(
+        return_value=SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="thinking"), SimpleNamespace(type="text", text="hello")],
+        )
+    )
+    cog = Description(make_bot(), {"claude": (client, "claude-haiku-5-5")}, image_prompt)
+    return cog, client.messages.create
+
+
+def enabled(**settings):
+    return patch("cogs.description.get_description_settings", AsyncMock(return_value={"enabled": True, **settings}))
 
 
 class ListenerTests(unittest.IsolatedAsyncioTestCase):
@@ -105,7 +138,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         cog, generate = make_cog("hello")
         message = make_message("<@1> hi", mentions=[BOT])
 
-        with patch("cogs.gemini.get_gemini_enabled", AsyncMock(return_value=False)):
+        with patch("cogs.description.get_description_settings", AsyncMock(return_value={})):
             await cog.on_message(message)
 
         generate.assert_not_called()
@@ -115,7 +148,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         cog, generate = make_cog("x" * 2500)
         message = make_message("<@1> tell me a story", mentions=[BOT])
 
-        with patch("cogs.gemini.get_gemini_enabled", AsyncMock(return_value=True)):
+        with enabled():
             await cog.on_message(message)
 
         self.assertEqual("tell me a story", generate.call_args.kwargs["contents"])
@@ -128,7 +161,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         cog, generate = make_cog("A cat.", image_prompt="Describe it.")
         message = make_message("look", attachments=[make_attachment()])
 
-        with patch("cogs.gemini.get_gemini_enabled", AsyncMock(return_value=True)):
+        with enabled():
             await cog.on_message(message)
 
         generate.assert_called_once()
@@ -143,7 +176,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         image_only = make_message("look", attachments=[make_attachment()])
         mention = make_message("<@1> hi", mentions=[BOT])
 
-        with patch("cogs.gemini.get_gemini_enabled", AsyncMock(return_value=True)):
+        with enabled():
             await cog.on_message(image_only)
             generate.assert_not_called()
             await cog.on_message(mention)
@@ -154,13 +187,70 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limits_each_user(self):
         cog, generate = make_cog("hello")
 
-        with patch("cogs.gemini.get_gemini_enabled", AsyncMock(return_value=True)):
+        with enabled():
             await cog.on_message(make_message("<@1> one", mentions=[BOT]))
             second = make_message("<@1> two", mentions=[BOT])
             await cog.on_message(second)
 
         self.assertEqual(1, generate.call_count)
         second.add_reaction.assert_called_once()
+
+
+class ClaudeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_asks_claude_at_medium_effort_and_replies_with_its_text(self):
+        cog, create = make_claude_cog()
+        message = make_message("<@1> hi", mentions=[BOT])
+
+        with enabled():
+            await cog.on_message(message)
+
+        kwargs = create.call_args.kwargs
+        self.assertEqual("claude-haiku-5-5", kwargs["model"])
+        self.assertEqual({"effort": "medium"}, kwargs["output_config"])
+        self.assertEqual([{"type": "text", "text": "hi"}], kwargs["messages"][0]["content"])
+        self.assertEqual("hello", message.reply.call_args.args[0])
+
+    async def test_sends_images_to_claude_as_base64_before_the_prompt(self):
+        cog, create = make_claude_cog(image_prompt="Describe it.")
+        message = make_message("look", attachments=[make_attachment()])
+
+        with enabled():
+            await cog.on_message(message)
+
+        image, text = create.call_args.kwargs["messages"][0]["content"]
+        self.assertEqual({"type": "base64", "media_type": "image/png", "data": "cG5n"}, image["source"])
+        self.assertEqual({"type": "text", "text": "Describe it."}, text)
+
+    async def test_uses_the_guilds_chosen_provider(self):
+        gemini_cog, generate = make_cog("from gemini")
+        claude_cog, create = make_claude_cog()
+        cog = Description(
+            make_bot(), {**claude_cog.providers, **gemini_cog.providers}, None
+        )
+        message = make_message("<@1> hi", mentions=[BOT])
+
+        with enabled(provider="gemini"):
+            await cog.on_message(message)
+
+        create.assert_not_called()
+        generate.assert_called_once()
+        self.assertEqual("from gemini", message.reply.call_args.args[0])
+
+
+class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switches_only_to_configured_providers(self):
+        cog, _ = make_claude_cog()
+        ctx = SimpleNamespace(guild=SimpleNamespace(id=5), send=AsyncMock())
+        update = AsyncMock()
+
+        with patch("cogs.description.update_description_settings", update), enabled(provider="claude"):
+            await cog.description_model.callback(cog, ctx, "gemini")
+            update.assert_not_called()
+            self.assertIn("isn't set up", ctx.send.call_args.args[0])
+
+            await cog.description_model.callback(cog, ctx, "claude")
+            update.assert_called_once_with("5", provider="claude")
+            self.assertEqual("Descriptions use Claude (claude-haiku-5-5) in this server.", ctx.send.call_args.args[0])
 
 
 class AdminGateTests(unittest.IsolatedAsyncioTestCase):
@@ -171,7 +261,7 @@ class AdminGateTests(unittest.IsolatedAsyncioTestCase):
             author=SimpleNamespace(guild_permissions=discord.Permissions(manage_guild=True)),
         )
 
-        results = [await discord.utils.maybe_coroutine(check, ctx) for check in cog.gemini.checks]
+        results = [await discord.utils.maybe_coroutine(check, ctx) for check in cog.description.checks]
 
         self.assertIn(False, results)
 
