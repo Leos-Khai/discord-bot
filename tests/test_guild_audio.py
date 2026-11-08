@@ -47,6 +47,10 @@ class RecordingAudio:
         if self.track_after:
             self.track_after(None)
 
+    def skip_speech(self):
+        self.events.append(("skip speech",))
+        self.speech_complete(None)
+
     def set_volume(self, value):
         self.events.append(("volume", value))
 
@@ -138,7 +142,7 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_starts_guild_playback_under_a_spoken_message_already_in_progress(self):
         accepted = await self.coordinator.enqueue_speech(
-            "user-1", "voice-1", "hello", bypass_cooldown=True
+            "user-1", "voice-1", "hello"
         )
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
 
@@ -150,7 +154,7 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.coordinator.pause()
         accepted = await self.coordinator.enqueue_speech(
-            "user-1", "voice-1", "hello", bypass_cooldown=True
+            "user-1", "voice-1", "hello"
         )
 
         self.assertTrue(accepted.accepted)
@@ -167,13 +171,13 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.coordinator.register_queued_playback_starter(start_queued)
 
-        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         self.assertEqual([("speech", "hello"), ("playback", "queued song", 1.0)], self.audio.events)
 
     async def test_skip_keeps_the_spoken_message_and_stop_discards_it(self):
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
-        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         speech_complete = self.audio.speech_complete
         self.coordinator.stop()
@@ -189,14 +193,25 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.audio.disconnected)
         self.assertIn(("stop",), self.audio.events)
 
-        rejected = await self.coordinator.enqueue_speech("user-2", "voice-2", "later", bypass_cooldown=True)
+        rejected = await self.coordinator.enqueue_speech("user-2", "voice-2", "later")
         self.assertFalse(rejected.accepted)
+
+    async def test_stopping_speech_skips_the_current_message_and_drops_the_queue(self):
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "first")
+        queued = await self.coordinator.enqueue_speech("user-1", "voice-1", "second")
+
+        await self.coordinator.stop_speech()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertTrue(queued.queued)
+        self.assertEqual([("speech", "first"), ("skip speech",)], self.audio.events)
 
     async def test_speech_failure_does_not_interrupt_guild_playback(self):
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
         self.audio.fail_speech = True
 
-        result = await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        result = await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         self.assertFalse(result.accepted)
         self.assertTrue(self.coordinator.is_playing())

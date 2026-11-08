@@ -78,6 +78,9 @@ class _GuildAudioMixer(discord.AudioSource):
             self._speech = source
             self._speech_complete = complete
 
+    def skip_speech(self):
+        self._finish_speech(None)
+
     def pause_music(self):
         self._music_paused = True
 
@@ -238,6 +241,10 @@ class DiscordGuildAudioOutput:
         if self._mixer:
             self._mixer.skip_music()
 
+    def skip_speech(self):
+        if self._mixer:
+            self._mixer.skip_speech()
+
     def set_volume(self, value):
         if self._mixer:
             self._mixer.set_music_volume(value)
@@ -339,6 +346,7 @@ class GuildAudioOutput(Protocol):
     def pause_playback(self) -> None: ...
     def resume_playback(self) -> None: ...
     def skip_playback(self) -> None: ...
+    def skip_speech(self) -> None: ...
     def resume_after_reconnect(self) -> None: ...
     def set_volume(self, value: float) -> None: ...
     async def stop_all(self) -> None: ...
@@ -359,13 +367,16 @@ class GuildAudioCoordinator(TtsSpeaker):
     def register_queued_playback_starter(self, start) -> None:
         self._queued_playback_starter = start
 
-    async def enqueue_speech(
-        self, user_id: str, voice: str, message: str, *, bypass_cooldown: bool = False
-    ) -> TtsEnqueueResult:
-        result = await self._tts.enqueue(user_id, voice, message, bypass_cooldown=bypass_cooldown)
+    async def enqueue_speech(self, user_id: str, voice: str, message: str) -> TtsEnqueueResult:
+        result = await self._tts.enqueue(user_id, voice, message)
         if result.accepted and not self._playback_active and self._queued_playback_starter:
             await self._queued_playback_starter()
         return result
+
+    async def stop_speech(self) -> None:
+        # Clear first so finishing the current message does not start the next one.
+        await self._tts.clear()
+        self._output.skip_speech()
 
     async def speak(
         self, request: TtsRequest, complete: Callable[[Optional[Exception]], None]

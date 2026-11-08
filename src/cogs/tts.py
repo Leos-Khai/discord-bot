@@ -13,7 +13,7 @@ from command_help import apply_parameter_descriptions, describe_parameters
 from db import get_database_service
 from guild_command_access import GuildCommandChannelAccess
 from logger import get_logger
-from tts import TtsPreferences
+from tts import SpeakerIntroductions, TtsPreferences
 
 
 VOICE_CACHE_SECONDS = 24 * 60 * 60
@@ -72,6 +72,9 @@ class TtsCommands(commands.Cog):
         self._voice_cache: list[dict] = []
         self._voices_cached_at = 0.0
         self._voice_lock = asyncio.Lock()
+        self.introductions = SpeakerIntroductions()
+        # shortcut: auto-announce channels live in memory and reset on restart; persist them if that matters.
+        self.auto_channels: set[int] = set()
 
     async def cog_check(self, ctx):
         decision = await self.command_access.evaluate(
@@ -136,20 +139,60 @@ class TtsCommands(commands.Cog):
     def _audio(self, guild: discord.Guild):
         return self.bot.guild_audio.for_guild(guild)
 
+    async def _speak(self, member: discord.Member, message: str):
+        guild_id, user_id = str(member.guild.id), str(member.id)
+        voice = await self.preferences.voice_for(guild_id, user_id)
+        text = self.introductions.text(guild_id, user_id, member.display_name, message)
+        return await self._audio(member.guild).enqueue_speech(user_id, voice, text)
+
+    @commands.hybrid_command(name="ttsstop", help="Stop the current TTS message and clear the TTS queue.")
+    async def ttsstop(self, ctx):
+        await self._audio(ctx.guild).stop_speech()
+        await ctx.send("Stopped TTS and cleared the queue.")
+
+    @commands.hybrid_command(name="ttsmode", help="Toggle speaking every message sent in this channel.")
+    async def ttsmode(self, ctx):
+        channel_id = ctx.channel.id
+        if channel_id in self.auto_channels:
+            self.auto_channels.discard(channel_id)
+            await ctx.send("TTS mode is off. Only !tts messages will be spoken.")
+        else:
+            self.auto_channels.add(channel_id)
+            await ctx.send("TTS mode is on. Every message in this channel will be spoken.")
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild or message.channel.id not in self.auto_channels:
+            return
+        prefixes = await self.bot.get_prefix(message)
+        prefixes = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+        if not message.clean_content.strip() or message.content.startswith(prefixes):
+            return
+        decision = await self.command_access.evaluate(str(message.guild.id), str(message.channel.id))
+        voice_state = getattr(message.author, "voice", None)
+        channel = voice_state.channel if voice_state else None
+        client = message.guild.voice_client
+        # Chat from people outside the bot's voice channel is silently left unspoken.
+        if not decision.allowed or not channel or (client and client.is_connected() and client.channel != channel):
+            return
+        if not client:
+            try:
+                await self._audio(message.guild).ensure_connected(channel)
+            except discord.DiscordException as error:
+                self.logger.warning("Unable to join voice channel %s: %s", channel.id, error)
+                await message.channel.send(f"I could not join your voice channel: {error}")
+                return
+        result = await self._speak(message.author, message.clean_content)
+        if not result.accepted:
+            await message.reply(f"TTS request rejected: {result.detail}", mention_author=False)
+
     @describe_parameters(message="Text for the bot to speak in your voice channel.")
     @commands.hybrid_command(name="tts", help="Speak a message in your voice channel.")
     @app_commands.describe(message="Text for the bot to speak in your voice channel.")
     async def tts(self, ctx, *, message: str):
         if not await self._ensure_voice_channel(ctx):
             return
-        guild_id, user_id = str(ctx.guild.id), str(ctx.author.id)
-        voice = await self.preferences.voice_for(guild_id, user_id)
-        result = await self._audio(ctx.guild).enqueue_speech(
-            user_id,
-            voice,
-            message,
-            bypass_cooldown=ctx.author.guild_permissions.administrator,
-        )
+        result = await self._speak(ctx.author, message)
         if not result.accepted:
             await ctx.send(f"TTS request rejected: {result.detail}")
         elif ctx.interaction:

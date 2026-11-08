@@ -17,7 +17,9 @@ Music and TTS commands are hybrid: they work with the prefix (`!play`) and as sl
 - `!volume [0-150]`: set the server's volume, or show it when no number is given. The setting is saved.
 
 ### Text-to-speech
-- `!tts <message>`: speak a message in your voice channel. It plays over any music without stopping it.
+- `!tts <message>`: speak a message in your voice channel. It plays over any music without stopping it. Messages queue up and are read in order, starting with the sender's name unless they were the last one heard within 10 seconds.
+- `!ttsmode`: toggle speaking every message people send in this channel. The bot only replies if a message can't be spoken. Resets when the bot restarts.
+- `!ttsstop`: stop the message being spoken and clear the TTS queue.
 - `!listvoice [language]`: list available voices, optionally filtered by language (`en`, `en-GB`).
 - `!setttsvoice <voice>`: choose your voice for this server, using an ID from `!listvoice`.
 
