@@ -152,10 +152,9 @@ class TtsCommands(commands.Cog):
         )
         if not result.accepted:
             await ctx.send(f"TTS request rejected: {result.detail}")
-        elif result.queued:
-            await ctx.send("TTS message queued.")
-        else:
-            await ctx.send("Speaking your message.")
+        elif ctx.interaction:
+            # Discord requires a slash command to be answered, so only the invoker sees this.
+            await ctx.send("TTS message queued." if result.queued else "Speaking your message.", ephemeral=True)
 
     @describe_parameters(voice="Exact voice ID shown by the listvoice command.")
     @commands.hybrid_command(name="setttsvoice", help="Set your TTS voice for this server.")
