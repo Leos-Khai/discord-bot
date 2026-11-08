@@ -394,6 +394,8 @@ class MusicCommands(commands.Cog):
     async def on_voice_state_update(self, member, before, after):
         if not self.bot.user or member.id != self.bot.user.id or not before.channel or after.channel:
             return
+        if await self.bot.guild_audio.survived_voice_drop(member.guild):
+            return
         guild_id = str(member.guild.id)
         playback = self.playbacks.pop(guild_id, None)
         self.outcomes.pop(guild_id, None)

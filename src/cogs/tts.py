@@ -204,7 +204,8 @@ class TtsCommands(commands.Cog):
             return
         guild_id = str(member.guild.id)
         if self.bot.user and member.id == self.bot.user.id and before.channel and not after.channel:
-            await self.bot.guild_audio.discard(guild_id)
+            if not await self.bot.guild_audio.survived_voice_drop(member.guild):
+                await self.bot.guild_audio.discard(guild_id)
             return
         client = member.guild.voice_client
         if not client or not client.channel:
