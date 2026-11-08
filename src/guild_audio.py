@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+import asyncio
 import os
 from pathlib import Path
 import tempfile
@@ -17,6 +18,8 @@ from tts import TtsEnqueueResult, TtsQueue, TtsRequest, TtsSpeaker
 PCM_FRAME_BYTES = 960 * 2 * 2
 DUCKED_MUSIC_VOLUME = 0.20
 FADE_FRAMES = 50
+RECONNECT_GRACE_SECONDS = 10
+RECONNECT_POLL_SECONDS = 0.25
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1",
     "options": "-vn -bufsize 512k -maxrate 128k",
@@ -74,6 +77,9 @@ class _GuildAudioMixer(discord.AudioSource):
                 raise RuntimeError("A TTS message is already playing")
             self._speech = source
             self._speech_complete = complete
+
+    def skip_speech(self):
+        self._finish_speech(None)
 
     def pause_music(self):
         self._music_paused = True
@@ -153,6 +159,11 @@ class _GuildAudioMixer(discord.AudioSource):
             source.cleanup()
 
     def cleanup(self):
+        # discord.py calls this whenever its player thread ends, including when a voice
+        # reconnect strands it, so the sources stay alive for playback to carry on.
+        self._drain_retired()
+
+    def close(self):
         self._drain_retired()
         self._finish_music(RuntimeError("Guild audio stopped"))
         self._finish_speech(RuntimeError("Guild audio stopped"))
@@ -230,14 +241,27 @@ class DiscordGuildAudioOutput:
         if self._mixer:
             self._mixer.skip_music()
 
+    def skip_speech(self):
+        if self._mixer:
+            self._mixer.skip_speech()
+
     def set_volume(self, value):
         if self._mixer:
             self._mixer.set_music_volume(value)
+
+    def resume_after_reconnect(self):
+        client = self._guild.voice_client
+        if self._mixer and client and client.is_connected():
+            # discord.py's reconnect ends its player thread without marking it stopped.
+            client.stop()
+            client.play(self._mixer, after=lambda error: None)
 
     async def stop_all(self):
         client = self._guild.voice_client
         if client:
             client.stop()
+        if self._mixer:
+            self._mixer.close()
         self._mixer = None
 
     async def disconnect(self):
@@ -252,6 +276,7 @@ class GuildAudioRegistry:
     def __init__(self, logger=None):
         self._logger = logger
         self._coordinators: dict[str, GuildAudioCoordinator] = {}
+        self._reconnect_waits: dict[str, asyncio.Future] = {}
 
     def for_guild(self, guild):
         guild_id = str(guild.id)
@@ -263,6 +288,33 @@ class GuildAudioRegistry:
             )
             self._coordinators[guild_id] = coordinator
         return coordinator
+
+    async def survived_voice_drop(self, guild) -> bool:
+        """Tells a voice reconnect, which briefly reports the bot as having left, from a real leave."""
+        guild_id = str(guild.id)
+        wait = self._reconnect_waits.get(guild_id)
+        # Every listener reacting to the same leave shares one wait, so audio resumes once.
+        if wait is None or wait.done():
+            wait = self._reconnect_waits[guild_id] = asyncio.ensure_future(self._await_reconnect(guild))
+        return await wait
+
+    async def _await_reconnect(self, guild) -> bool:
+        client = guild.voice_client
+        if client is None:
+            return False
+        for _ in range(int(RECONNECT_GRACE_SECONDS / RECONNECT_POLL_SECONDS)):
+            await asyncio.sleep(RECONNECT_POLL_SECONDS)
+            # A real disconnect drops the voice client; a reconnect keeps it.
+            if guild.voice_client is not client:
+                return False
+            if client.is_connected():
+                if self._logger:
+                    self._logger.info("Voice reconnected for guild %s, resuming audio", guild.id)
+                coordinator = self._coordinators.get(str(guild.id))
+                if coordinator:
+                    coordinator.resume_after_reconnect()
+                return True
+        return False
 
     async def discard(self, guild_id: str):
         coordinator = self._coordinators.pop(guild_id, None)
@@ -294,6 +346,8 @@ class GuildAudioOutput(Protocol):
     def pause_playback(self) -> None: ...
     def resume_playback(self) -> None: ...
     def skip_playback(self) -> None: ...
+    def skip_speech(self) -> None: ...
+    def resume_after_reconnect(self) -> None: ...
     def set_volume(self, value: float) -> None: ...
     async def stop_all(self) -> None: ...
     async def disconnect(self) -> None: ...
@@ -313,13 +367,16 @@ class GuildAudioCoordinator(TtsSpeaker):
     def register_queued_playback_starter(self, start) -> None:
         self._queued_playback_starter = start
 
-    async def enqueue_speech(
-        self, user_id: str, voice: str, message: str, *, bypass_cooldown: bool = False
-    ) -> TtsEnqueueResult:
-        result = await self._tts.enqueue(user_id, voice, message, bypass_cooldown=bypass_cooldown)
+    async def enqueue_speech(self, user_id: str, voice: str, message: str) -> TtsEnqueueResult:
+        result = await self._tts.enqueue(user_id, voice, message)
         if result.accepted and not self._playback_active and self._queued_playback_starter:
             await self._queued_playback_starter()
         return result
+
+    async def stop_speech(self) -> None:
+        # Clear first so finishing the current message does not start the next one.
+        await self._tts.clear()
+        self._output.skip_speech()
 
     async def speak(
         self, request: TtsRequest, complete: Callable[[Optional[Exception]], None]
@@ -378,6 +435,10 @@ class GuildAudioCoordinator(TtsSpeaker):
 
     def set_volume(self, value: float) -> None:
         self._output.set_volume(value)
+
+    def resume_after_reconnect(self) -> None:
+        if not self._closed:
+            self._output.resume_after_reconnect()
 
     async def disconnect(self) -> None:
         await self.close()

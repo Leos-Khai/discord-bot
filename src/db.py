@@ -69,6 +69,7 @@ class DatabaseService:
         self.custom_messages = self.db.custom_messages
         self.music_channel_limits = self.db.music_channel_limits
         self.guild_playback_settings = self.db.guild_playback_settings
+        self.guild_gemini_settings = self.db.guild_gemini_settings
         self.user_tts_voices = self.db.user_tts_voices
         self.notification_channels = self.db.notification_channels
         self.youtube_subscriptions = self.db.youtube_subscriptions
@@ -87,6 +88,7 @@ class DatabaseService:
         )
         await self.music_channel_limits.create_index("guild_id", unique=True)
         await self.guild_playback_settings.create_index("guild_id", unique=True)
+        await self.guild_gemini_settings.create_index("guild_id", unique=True)
         await self.user_tts_voices.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
         await self.notification_channels.create_index("guild_id", unique=True)
         await self.youtube_subscriptions.create_index(
@@ -309,6 +311,25 @@ class DatabaseService:
             {"guild_id": guild_id},
             {
                 "$set": {"volume": volume, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+    # ---- Descriptions ------------------------------------------------- #
+    # The collection keeps its Gemini-era name so existing on/off choices survive.
+    async def get_description_settings(self, guild_id: str) -> dict:
+        doc = await self.guild_gemini_settings.find_one(
+            {"guild_id": guild_id}, {"_id": 0, "enabled": 1, "provider": 1}
+        )
+        return doc or {}
+
+    async def update_description_settings(self, guild_id: str, **fields) -> None:
+        now = datetime.utcnow()
+        await self.guild_gemini_settings.update_one(
+            {"guild_id": guild_id},
+            {
+                "$set": {**fields, "updated_at": now},
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
@@ -818,6 +839,14 @@ async def get_playback_volume(guild_id: str):
 
 async def set_playback_volume(guild_id: str, volume: float):
     return await _db_service.set_playback_volume(guild_id, volume)
+
+
+async def get_description_settings(guild_id: str):
+    return await _db_service.get_description_settings(guild_id)
+
+
+async def update_description_settings(guild_id: str, **fields):
+    return await _db_service.update_description_settings(guild_id, **fields)
 
 
 async def get_tts_voice(guild_id: str, user_id: str):

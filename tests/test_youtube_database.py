@@ -105,6 +105,7 @@ class YouTubeDatabaseTests(unittest.IsolatedAsyncioTestCase):
             "custom_messages",
             "music_channel_limits",
             "guild_playback_settings",
+            "guild_gemini_settings",
             "user_tts_voices",
             "notification_channels",
             "youtube_channel_observations",

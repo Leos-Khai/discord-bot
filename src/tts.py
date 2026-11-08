@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, Optional, Protocol
 
 DEFAULT_TTS_VOICE = "en-US-AriaNeural"
 MAX_TTS_MESSAGE_LENGTH = 300
-TTS_COOLDOWN_SECONDS = 5.0
+SPEAKER_NAME_WINDOW_SECONDS = 10.0
 
 
 class TtsPreferenceStore(Protocol):
@@ -51,71 +51,71 @@ class TtsPreferences:
         await self._store.set_tts_voice(guild_id, user_id, voice)
 
 
+class SpeakerIntroductions:
+    """Prefixes a message with the sender's name unless they were the last one heard recently."""
+
+    def __init__(self, window_seconds: float = SPEAKER_NAME_WINDOW_SECONDS, clock: Callable[[], float] = time.monotonic):
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._last: dict[str, tuple[str, float]] = {}
+
+    def text(self, guild_id: str, user_id: str, name: str, message: str) -> str:
+        now = self._clock()
+        last = self._last.get(guild_id)
+        self._last[guild_id] = (user_id, now)
+        if last and last[0] == user_id and now - last[1] < self._window_seconds:
+            return message
+        return f"{name}, {message}"
+
+
 class TtsQueue:
-    """Serializes one guild's spoken messages and enforces request limits."""
+    """Speaks one guild's messages one after another, in the order they arrive."""
 
     def __init__(
         self,
         speaker: TtsSpeaker,
         *,
-        clock: Callable[[], float] = time.monotonic,
         max_length: int = MAX_TTS_MESSAGE_LENGTH,
-        cooldown_seconds: float = TTS_COOLDOWN_SECONDS,
         on_error: Optional[Callable[[Exception], None]] = None,
         on_idle: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self._speaker = speaker
-        self._clock = clock
         self._max_length = max_length
-        self._cooldown_seconds = cooldown_seconds
         self._on_error = on_error
         self._on_idle = on_idle
         self._requests: list[TtsRequest] = []
-        self._pending_users: set[str] = set()
-        self._last_requested: dict[str, float] = {}
         self._active: Optional[TtsRequest] = None
         self._closed = False
         self._lock = asyncio.Lock()
         self._loop = asyncio.get_running_loop()
 
-    async def enqueue(
-        self, user_id: str, voice: str, message: str, *, bypass_cooldown: bool = False
-    ) -> TtsEnqueueResult:
+    async def enqueue(self, user_id: str, voice: str, message: str) -> TtsEnqueueResult:
         message = message.strip()
         if not message:
             return TtsEnqueueResult(False, detail="Please provide a message to speak")
         if len(message) > self._max_length:
             return TtsEnqueueResult(False, detail=f"Messages are limited to {self._max_length} characters")
 
-        now = self._clock()
         async with self._lock:
             if self._closed:
                 return TtsEnqueueResult(False, detail="TTS is unavailable in this voice channel")
-            if user_id in self._pending_users:
-                return TtsEnqueueResult(False, detail="already have a TTS message pending")
-            if not bypass_cooldown and user_id in self._last_requested:
-                remaining = self._cooldown_seconds - (now - self._last_requested[user_id])
-                if remaining > 0:
-                    return TtsEnqueueResult(
-                        False,
-                        detail=f"Please wait {int(remaining + 0.999)} more second(s) before using TTS again",
-                    )
-            request = TtsRequest(user_id, voice, message)
             queued = bool(self._active or self._requests)
-            self._requests.append(request)
-            self._pending_users.add(user_id)
-            self._last_requested[user_id] = now
+            self._requests.append(TtsRequest(user_id, voice, message))
 
         error = await self._start_next()
         if error:
             return TtsEnqueueResult(False, detail=str(error))
         return TtsEnqueueResult(True, queued=queued)
 
+    async def clear(self) -> None:
+        """Drops every message still waiting; the one already speaking is left to the caller."""
+        async with self._lock:
+            self._requests.clear()
+
     async def close(self) -> None:
         async with self._lock:
             self._closed = True
             self._requests.clear()
-            self._pending_users.clear()
             self._active = None
 
     async def _start_next(self) -> Optional[Exception]:
@@ -138,9 +138,7 @@ class TtsQueue:
 
     async def _advance(self, error: Optional[Exception]) -> None:
         async with self._lock:
-            if self._active:
-                self._pending_users.discard(self._active.user_id)
-                self._active = None
+            self._active = None
             if self._closed:
                 return
             idle = not self._requests

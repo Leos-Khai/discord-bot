@@ -1,10 +1,12 @@
+import asyncio
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from guild_audio import GuildAudioCoordinator, _GuildAudioMixer
+from guild_audio import GuildAudioCoordinator, GuildAudioRegistry, _GuildAudioMixer
 from guild_playback import Track
 
 
@@ -45,8 +47,15 @@ class RecordingAudio:
         if self.track_after:
             self.track_after(None)
 
+    def skip_speech(self):
+        self.events.append(("skip speech",))
+        self.speech_complete(None)
+
     def set_volume(self, value):
         self.events.append(("volume", value))
+
+    def resume_after_reconnect(self):
+        self.events.append(("reconnect",))
 
     async def stop_all(self):
         self.events.append(("stop",))
@@ -111,6 +120,20 @@ class GuildAudioMixerTests(unittest.TestCase):
         self.assertEqual(b"", frame)
         self.assertEqual([("current", None)], completions)
 
+    def test_the_player_ending_keeps_sources_until_the_mixer_is_closed(self):
+        mixer = _GuildAudioMixer()
+        completions = []
+        music = StubSource(frames=[b"\x00" * 3840])
+        mixer.set_music(music, lambda error: completions.append(error))
+
+        mixer.cleanup()
+        self.assertFalse(music.cleaned)
+        self.assertNotEqual(b"", mixer.read())
+
+        mixer.close()
+        self.assertTrue(music.cleaned)
+        self.assertEqual(["Guild audio stopped"], [str(error) for error in completions])
+
 
 class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -119,7 +142,7 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_starts_guild_playback_under_a_spoken_message_already_in_progress(self):
         accepted = await self.coordinator.enqueue_speech(
-            "user-1", "voice-1", "hello", bypass_cooldown=True
+            "user-1", "voice-1", "hello"
         )
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
 
@@ -131,7 +154,7 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.coordinator.pause()
         accepted = await self.coordinator.enqueue_speech(
-            "user-1", "voice-1", "hello", bypass_cooldown=True
+            "user-1", "voice-1", "hello"
         )
 
         self.assertTrue(accepted.accepted)
@@ -148,13 +171,13 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.coordinator.register_queued_playback_starter(start_queued)
 
-        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         self.assertEqual([("speech", "hello"), ("playback", "queued song", 1.0)], self.audio.events)
 
     async def test_skip_keeps_the_spoken_message_and_stop_discards_it(self):
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
-        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         speech_complete = self.audio.speech_complete
         self.coordinator.stop()
@@ -170,14 +193,25 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.audio.disconnected)
         self.assertIn(("stop",), self.audio.events)
 
-        rejected = await self.coordinator.enqueue_speech("user-2", "voice-2", "later", bypass_cooldown=True)
+        rejected = await self.coordinator.enqueue_speech("user-2", "voice-2", "later")
         self.assertFalse(rejected.accepted)
+
+    async def test_stopping_speech_skips_the_current_message_and_drops_the_queue(self):
+        await self.coordinator.enqueue_speech("user-1", "voice-1", "first")
+        queued = await self.coordinator.enqueue_speech("user-1", "voice-1", "second")
+
+        await self.coordinator.stop_speech()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertTrue(queued.queued)
+        self.assertEqual([("speech", "first"), ("skip speech",)], self.audio.events)
 
     async def test_speech_failure_does_not_interrupt_guild_playback(self):
         await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
         self.audio.fail_speech = True
 
-        result = await self.coordinator.enqueue_speech("user-1", "voice-1", "hello", bypass_cooldown=True)
+        result = await self.coordinator.enqueue_speech("user-1", "voice-1", "hello")
 
         self.assertFalse(result.accepted)
         self.assertTrue(self.coordinator.is_playing())
@@ -202,3 +236,36 @@ class GuildAudioCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             await self.coordinator.play(Track("song", "stream://song"), 1.0, lambda error: None)
 
         self.assertFalse(self.coordinator.is_playing())
+
+
+class FakeVoiceClient:
+    def __init__(self):
+        self.connected = False
+
+    def is_connected(self):
+        return self.connected
+
+
+class GuildAudioRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_voice_reconnect_resumes_audio_once_for_every_listener(self):
+        registry = GuildAudioRegistry()
+        audio = RecordingAudio()
+        registry._coordinators["1"] = GuildAudioCoordinator(audio)
+        client = FakeVoiceClient()
+        guild = SimpleNamespace(id=1, voice_client=client)
+
+        waits = asyncio.gather(registry.survived_voice_drop(guild), registry.survived_voice_drop(guild))
+        await asyncio.sleep(0.3)
+        client.connected = True
+
+        self.assertEqual([True, True], await waits)
+        self.assertEqual([("reconnect",)], audio.events)
+
+    async def test_a_real_disconnect_is_not_mistaken_for_a_reconnect(self):
+        registry = GuildAudioRegistry()
+        guild = SimpleNamespace(id=1, voice_client=FakeVoiceClient())
+
+        wait = asyncio.ensure_future(registry.survived_voice_drop(guild))
+        guild.voice_client = None
+
+        self.assertFalse(await wait)

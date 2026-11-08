@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from guild_command_access import GuildCommandChannelAccess
-from tts import DEFAULT_TTS_VOICE, TtsPreferences, TtsQueue
+from tts import DEFAULT_TTS_VOICE, SpeakerIntroductions, TtsPreferences, TtsQueue
 
 
 class FakePreferencesStore:
@@ -36,6 +36,20 @@ class TtsPreferencesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(DEFAULT_TTS_VOICE, await preferences.voice_for("guild-2", "user-1"))
 
 
+class SpeakerIntroductionsTests(unittest.TestCase):
+    def test_names_the_sender_unless_they_were_the_last_heard_within_the_window(self):
+        clock = [100.0]
+        introductions = SpeakerIntroductions(clock=lambda: clock[0])
+
+        self.assertEqual("Leo, hi", introductions.text("g", "u1", "Leo", "hi"))
+        clock[0] = 109.0
+        self.assertEqual("again", introductions.text("g", "u1", "Leo", "again"))
+        clock[0] = 120.0
+        self.assertEqual("Leo, later", introductions.text("g", "u1", "Leo", "later"))
+        self.assertEqual("Sam, yo", introductions.text("g", "u2", "Sam", "yo"))
+        self.assertEqual("Leo, back", introductions.text("g", "u1", "Leo", "back"))
+
+
 class FakeSpeaker:
     def __init__(self):
         self.requests = []
@@ -50,46 +64,30 @@ class FakeSpeaker:
 
 
 class TtsQueueTests(unittest.IsolatedAsyncioTestCase):
-    async def test_serializes_requests_and_rejects_a_second_pending_request_from_the_same_user(self):
-        clock = [100.0]
+    async def test_queues_every_message_in_order_including_repeats_from_one_user(self):
         speaker = FakeSpeaker()
-        queue = TtsQueue(speaker, clock=lambda: clock[0])
+        queue = TtsQueue(speaker)
 
         first = await queue.enqueue("user-1", "voice-1", "first")
+        again = await queue.enqueue("user-1", "voice-1", "again")
         second = await queue.enqueue("user-2", "voice-2", "second")
-        duplicate = await queue.enqueue("user-1", "voice-1", "again")
 
-        self.assertTrue(first.accepted)
-        self.assertTrue(second.accepted)
-        self.assertFalse(duplicate.accepted)
-        self.assertEqual("already have a TTS message pending", duplicate.detail)
+        self.assertTrue(first.accepted and again.accepted and second.accepted)
+        self.assertTrue(again.queued)
         self.assertEqual(["first"], [request.message for request in speaker.requests])
 
         speaker.finish()
         await self._flush()
-
-        self.assertEqual(["first", "second"], [request.message for request in speaker.requests])
-
-    async def test_rejects_messages_over_the_limit_and_enforces_the_user_cooldown(self):
-        clock = [100.0]
-        speaker = FakeSpeaker()
-        queue = TtsQueue(speaker, clock=lambda: clock[0])
-
-        too_long = await queue.enqueue("user-1", "voice-1", "x" * 301)
-        first = await queue.enqueue("user-1", "voice-1", "first")
         speaker.finish()
         await self._flush()
-        clock[0] = 103.0
-        cooldown = await queue.enqueue("user-1", "voice-1", "second")
-        clock[0] = 105.0
-        allowed = await queue.enqueue("user-1", "voice-1", "third")
+
+        self.assertEqual(["first", "again", "second"], [request.message for request in speaker.requests])
+
+    async def test_rejects_messages_over_the_limit(self):
+        too_long = await TtsQueue(FakeSpeaker()).enqueue("user-1", "voice-1", "x" * 301)
 
         self.assertFalse(too_long.accepted)
         self.assertEqual("Messages are limited to 300 characters", too_long.detail)
-        self.assertTrue(first.accepted)
-        self.assertFalse(cooldown.accepted)
-        self.assertEqual("Please wait 2 more second(s) before using TTS again", cooldown.detail)
-        self.assertTrue(allowed.accepted)
 
     async def _flush(self):
         await __import__("asyncio").sleep(0)
